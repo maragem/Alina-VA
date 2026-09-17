@@ -1,0 +1,137 @@
+# haystack-pipeline
+# TEST B - does tool calling work AT ALL through the EC gpt-5.1 endpoint?
+#
+# Throwaway pipeline. Deploy it under a name like `alina-testb-toolcall`, ask it
+# "What is the weather in Brussels?" in the Playground, and read the result.
+#
+# It is the ALINA agent stripped to the bone: same chat_generator, same EC proxy, no
+# streaming, no retrieval, no state, no PipelineTool - ONE trivial deepset CodeTool whose
+# schema is two plain strings. Everything that could be blamed on our own YAML is gone.
+#
+# WHAT EACH OUTCOME MEANS
+#
+#   1. It answers "20 degrees Celsius" and the trace shows the tool running
+#      -> tool calling works through this endpoint. The fault is in OUR tool definitions,
+#         and the prime suspect is now PipelineTool: the deployment logs show
+#           "Failed to serialize value: haystack.core.super_component.utils._delegate_default"
+#           "Unsupported primitive type 'getset_descriptor', falling back to 'string'"
+#         _delegate_default is SuperComponent's sentinel, and PipelineTool is built on
+#         SuperComponent - so the tool schemas we ship are being degraded on their way to
+#         the API. Next step in that branch: rebuild the three ALINA tools as CodeTools in
+#         this same shape (a plain @tool function that calls the retrieval itself), instead
+#         of wrapping nested pipelines.
+#
+#   2. It answers from its own knowledge, or returns nothing, and NO tool span appears
+#      -> the endpoint does not do tool calling in the shape Haystack sends. No pipeline
+#         YAML can fix that. Two follow-ups: ask the ECGPT team whether /responses supports
+#         function calling and in which payload shape, and fall back to PLAN B (the
+#         ConditionalRouter design in v1-agent.yaml's header) which needs no tool calling.
+#
+#   3. It errors with the same "A `ChatMessage` must contain at least one `TextContent`..."
+#      -> identical failure with a two-string tool schema. That fully exonerates our tools
+#         and points at the endpoint. Same follow-ups as outcome 2.
+#
+# THEN, whatever the outcome, run it a second time with streaming switched on (uncomment
+# the streaming_callback line) to learn whether streaming changes the answer. That single
+# extra run tells you whether streaming can be kept later.
+
+components:
+
+  agent:
+    type: haystack.components.agents.agent.Agent
+    init_parameters:
+      chat_generator:
+        # ===================== TEST B2: CHAT COMPLETIONS =====================
+        # Test B1 (same pipeline, OpenAIResponsesChatGenerator) reproduced the empty
+        # ChatMessage error with a two-string CodeTool schema, no PipelineTool, no
+        # retrieval, no state, no streaming. That exonerates every line of ALINA's own
+        # YAML: the /responses endpoint returns 200 with output that maps to no tool call.
+        #
+        # This variant changes ONE thing: the generator, and therefore the API surface.
+        # OpenAIChatGenerator talks to /chat/completions instead of /responses. Enterprise
+        # gateways (Azure-backed ones especially) generally implement Chat Completions
+        # fully - where function calling is long-standing and universal - and the Responses
+        # API later and partially. If tool calling works anywhere on this endpoint, it
+        # works here.
+        #
+        #   Tool call happens -> swap the generator in v1-agent.yaml the same way (already
+        #                        prepared there) and the agent design survives intact.
+        #   Same failure      -> this endpoint does not do tool calling at all. Stop
+        #                        debugging, go to Plan B, and raise it with the ECGPT team.
+        #
+        # To re-run the /responses variant, swap the type back to
+        #   haystack.components.generators.chat.openai_responses.OpenAIResponsesChatGenerator
+        # ====================================================================
+        type: haystack.components.generators.chat.openai.OpenAIChatGenerator
+        init_parameters:
+          model: gpt-5.1
+          api_key:
+            type: env_var
+            strict: true
+            env_vars:
+            - GPTEC_API_KEY
+          api_base_url: https://api.tech.ec.europa.eu/ecgpt/v1
+          generation_kwargs: {}
+
+      # Second run only: uncomment to test whether streaming changes anything.
+      # streaming_callback: deepset_cloud_custom_nodes.callbacks.streaming.streaming_callback
+
+      exit_conditions:
+      - text
+      max_agent_steps: 4
+
+      system_prompt: |-
+        {% message role="system" %}
+        You are a test assistant with one tool.
+
+        When the user asks about the weather, you MUST call the `get_weather` tool and
+        answer from its result. Never answer a weather question from your own knowledge,
+        and never say you cannot check the weather: the tool is available to you.
+        {% endmessage %}
+
+      user_prompt: |-
+        {% message role="user" %}
+        {{ query }}
+        {% endmessage %}
+      required_variables:
+      - query
+
+      tools:
+      # deepset's native custom-code tool, in the exact shape a Builder export produces.
+      # Two plain string parameters: nothing here can produce an unrepresentable schema.
+      - type: deepset_cloud_custom_nodes.tools.code_tool.CodeTool
+        data:
+          name: get_weather
+          description: Get the current weather for a city. Call this for any weather question.
+          code: |
+            from typing import Annotated, Literal
+
+            from haystack.tools import tool
+
+            @tool
+            def get_weather(
+                city: Annotated[str, "the city for which to get the weather"],
+                unit: Annotated[Literal["Celsius", "Fahrenheit"], "the unit for the temperature"]):
+                return {
+                    "city": city,
+                    "temperature": "20 degrees " + ("Celsius" if unit == "Celsius" else "Fahrenheit"),
+                }
+        _meta:
+          name: get_weather
+          description: Get the current weather for a city. Call this for any weather question.
+          tool_id:
+
+connections: []
+
+max_runs_per_component: 100
+
+metadata: {}
+
+inputs:
+  query:
+  - agent.query
+
+outputs:
+  messages: agent.messages
+
+pipeline_output_type: chat

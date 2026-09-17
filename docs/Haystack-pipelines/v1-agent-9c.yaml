@@ -1,0 +1,1873 @@
+# haystack-pipeline
+# ALINA v1 - AGENT pipeline DIGIT.R3 (DRAFT 9 - reference Q&A tool + tool-routing rules)
+#
+# DRAFT 9 (minimal, on top of the green draft 8):
+#   1. New tool `consult_reference_qa`: the 34 exemplar Q&A of "ALINA - Exemplar questions
+#      and answers" (DIGIT.R3) embedded IN the tool as static data. In-memory lexical lookup,
+#      no document store, no ingestion, no entitlement interaction. Its output never enters
+#      agent state, so an entry can never be cited as a source: it tells the agent WHICH
+#      instruments/provisions apply and what the answer should look like; the passages are
+#      still retrieved and cited from the corpus. Shape: PipelineTool wrapping ONE Code
+#      component, i.e. the exact shape of list_corpus_files, which is proven to import and
+#      run here.
+#   2. System prompt, "Using your tools" rewritten as a 4-step decision procedure:
+#        - named/referenced document -> ALWAYS list_corpus_files then search_in_file;
+#        - general / non-specific question (definition, general rule, principle) -> ALWAYS
+#          search_in_file on the Financial Regulation using its known file_id (file_id
+#          4abf8796-9157-4ceb-932e-74cb788e4f1b, hard-coded in the prompt), no listing needed;
+#        - consult_reference_qa first for any substantive question;
+#        - search_corpus for the rest.
+#      One "shape of an answer" line mirrors the structure of the exemplar entries.
+#   Nothing else changed: generator, streaming, state, tools 1-3, connections, I/O.
+#
+# DRAFT 9b (after the first runs of draft 9):
+#   3. Anti-laziness. The agent anchored on the Financial Regulation and stopped there.
+#      Step 3 of the procedure now makes a second search MANDATORY unless the FR passages
+#      answer exactly and completely; a new pre-answer check "Depth" repeats it from the
+#      answer side; the shape rule orders sources by descending authority (FR first, then
+#      guidance detail), as the exemplar Q&A does. max_agent_steps 8 -> 10 to pay for the
+#      extra round (nominal path: reference lookup, FR, corpus, [one in-file], answer).
+#   4. Authority visible to the agent. list_corpus_files now sorts by authority_rank
+#      (unknown last), prints the rank and its label on every line plus a legend in the
+#      header, and takes an optional `authority_rank` argument to list one level only.
+#      The prompt explains the scale and tells the agent to search/cite the lowest number
+#      first. PRECONDITION: authority_rank must be attached as file-level metadata at
+#      upload - the indexing pipeline does not populate it (alina-indexing-v0.4.yaml,
+#      header note). The FR file_id stays hard-coded in the prompt until that is done.
+#      UPDATE 07/09/2026: authority_rank IS populated now. The corpus scale is not the one
+#      assumed here (only the EU Charter is rank 1; the Financial Regulation is rank 2,
+#      guidance and the vademecum rank 3) - confirmed correct by DIGIT.R3, nothing to fix.
+#
+# ========================= DRAFT 9c: CITATION TOKENS (BUG FIX) ==============================
+# THE BUG (trace f6b32b91, 07/09/2026): the answer quoted the Guidelines on external
+# consultants but the reference numbers pointed at the Financial Regulation. Not a model
+# hallucination - the numbering was structurally wrong.
+#
+# Chain of evidence: at step 2 the model emitted FOUR tool calls in ONE assistant message
+# (search_in_file on the FR + 3x search_corpus). Haystack's ToolInvoker runs them in
+# PARALLEL against the SAME snapshot of agent state, which was still empty. All four
+# result_formatter spans therefore saw len(state_documents) == 0, computed offset 0, and
+# numbered their passages from [1]: the model received four blocks all using [1], [2],
+# [3]... for different documents. merge_lists then concatenated the four results in tool-
+# call order (FR first, 26 passages = panel [1]-[26], guidance from [27]), so [n] in the
+# answer no longer mapped to documents[n-1]. Same cause, second symptom: cross-tool dedup
+# also failed (each formatter deduped against an empty state), giving a 90-document panel
+# with 25 duplicates for ~10 actually cited passages.
+#
+# WHY THE OBVIOUS FIX WAS NOT TAKEN: `parallel_tool_calls: false` would restore the
+# invariant, but the parallelism is buying real latency here - four searches in 27s where
+# sequential would be 50-60s (the reranker alone is 7-10s per call) - and an unknown
+# parameter is a 400 on this gateway.
+#
+# THE FIX: make the reference independent of position and of execution order.
+#   - result_formatter and attachment_formatter now emit
+#         reference="<6 hex chars of sha1(document.id)>"
+#     a stable per-document token. No offset, no coordination between tools, so parallel
+#     calls cannot collide (~0.03% collision risk over 100 documents).
+#   - The model cites [a1b2c3] instead of [3] (see "Citing and quoting" in the prompt).
+#   - NEW trailing component `citation_renumberer` reads the final assistant message and
+#     the accumulated state documents, extracts the tokens in order of first appearance,
+#     rewrites them as [1], [2], [3]... and rebuilds the `documents` output to exactly the
+#     cited passages in that order. The [n] <-> documents[n-1] contract the app relies on
+#     is therefore restored by construction, and the sources panel now holds only what was
+#     actually cited (~10 instead of 90, duplicates gone).
+#   - The pipeline I/O contract is unchanged: same `documents` and `messages` outputs, they
+#     are simply produced by citation_renumberer instead of straight from the agent.
+#
+# NOTE if streaming is ever re-enabled (the commented streaming_callback below): the
+# streamed text would carry the raw tokens until the result event replaces it with the
+# renumbered text. Either keep the agent unstreamed, or renumber client-side.
+# ===========================================================================================
+#
+# ---------------------------------------------------------------------------------------------
+# DRAFT 7: `streaming_callback` removed from the agent. Both traces show tool_invoker as a
+# no-op (16ms, 6ms), i.e. the first generator call returns an empty assistant message every
+# single time - so the cause is structural, not per-tool. The one thing v0.x never did
+# through this EC proxy is send `tools`, and tool calls stream as different SSE events than
+# text. Full reasoning at the streaming_callback site.
+#
+# TWO CHECKS THAT SETTLE THIS - do them before changing anything else:
+#   A. Logs tab of a failing run: look for the warning "malformed JSON string for tool call
+#      arguments ... will be skipped". PRESENT -> the model did emit a tool call and its
+#      arguments were lost in transport (streaming): draft 7 is the fix. ABSENT -> the
+#      provider returned nothing usable at all, and the problem is upstream of Haystack.
+#   B. Isolation test, 5 minutes: a throwaway pipeline with this same chat_generator, no
+#      streaming, and ONE trivial deepset CodeTool (the get_weather @tool example from the
+#      docs). Ask it "what is the weather in Brussels". If no tool call happens there
+#      either, the EC gpt-5.1 endpoint does not do tool calling in the shape Haystack
+#      sends, and no amount of pipeline YAML will fix it - see PLAN B below.
+#
+# PLAN B if tool calling is unavailable through this endpoint: keep the v0.x fixed chain and
+# solve the named-document problem WITHOUT an agent - a ConditionalRouter in front of
+# retrieval, fed by a small extraction step that spots a document reference in the query and
+# resolves it against the file list, then routes to a file-filtered branch or the normal one.
+# Less flexible than an agent, but it needs no tool calling at all.
+#
+# DRAFT 6: every tool now declares its LLM-facing `parameters` schema explicitly instead
+# of letting PipelineTool derive it from input_mapping. Deriving it exposed `filters` and
+# `state_documents` (list[Document]) as model-supplied arguments, which produced malformed
+# tool-call arguments; Haystack drops such a call silently and hands back an EMPTY
+# assistant message, which then kills the next loop iteration. Full chain of evidence in
+# the comment above search_corpus.parameters.
+#
+# One diagnostic setting is still on: `generation_kwargs: {}` (reasoning off), kept only
+# so this fix is tested in isolation. Restore `reasoning_effort: medium` once green.
+#
+# DRAFT 4 (runtime): deepset's replayed chat history must be sanitized before it reaches
+# the Agent. The app sends no `messages`; deepset rebuilds prior turns from
+# search_session_id, and now that assistant turns carry tool calls, a content-less
+# ChatMessage can appear and the generator rejects it on outgoing serialization. See the
+# history_sanitizer component.
+#
+# DRAFT 3 (runtime): document stores MUST be declared in YAML, never built in Python.
+# deepset injects the real cluster host/credentials when a store is deserialized from the
+# YAML; a store constructed inside a Code component skips that hook and tries
+# localhost:9200. list_corpus_files now scans through a FilterRetriever (store in YAML)
+# and its Code component only reduces chunks to a file listing. See the tool for detail.
+#
+# See v1-agent-design.md for the full rationale. In one line: the v0.x fixed chain cannot
+# answer "what does <named document> say about X" from the named document, because nothing
+# resolves the name or constrains retrieval to it. This pipeline gives the LLM three tools
+# (list_corpus_files, search_corpus, search_in_file) and lets it decide.
+#
+# CONTRACT: only the v0.x pipeline I/O is kept. Same inputs (query, filters, messages,
+# files), same outputs (documents, messages), same streaming callback, pipeline_output_type
+# chat. Switching the app to this pipeline is a HAYSTACK_PIPELINE(_ID) env change only.
+#
+# ========================= DRAFT 2: WHAT THE FIRST IMPORT TAUGHT US =========================
+# The first import into deepset resolved most of the [U1]/[U2] uncertainty:
+#
+#   1. inputs_from_state maps {state_key: tool_parameter_name} with a STRING value
+#      (import error: "inputs_from_state values must be str, not list"). The fan-out to
+#      internal sockets stays in input_mapping, which DOES take lists. So a state-fed
+#      value needs BOTH entries:
+#          input_mapping:      state_documents: [result_formatter.state_documents]
+#          inputs_from_state:  documents: state_documents
+#   2. outputs_to_state has the shape {state_key: {source: <tool output name>}}.
+#   3. outputs_to_string: {source: <tool output name>} selects what the LLM receives as
+#      the tool result. Without it the tool would return ALL mapped outputs serialized,
+#      including the raw Document list - a context bomb. Required on both search tools.
+#   4. deepset's native custom-code tool is deepset_cloud_custom_nodes.tools.code_tool.CodeTool
+#      with data: {name, description, code} where code holds a @tool-decorated FUNCTION
+#      (haystack.tools.tool, Annotated params), plus a _meta block (Builder bookkeeping).
+#      It is NOT the ComponentTool-wrapping-a-Code-component shape of draft 1.
+#      list_corpus_files is nevertheless kept as a PipelineTool below, because it MUST
+#      receive the entitlement filters from state and the CodeTool path has no documented
+#      inputs_from_state - see the tool's own comment.
+#
+# STILL UNVERIFIED:
+#   [U1'] Whether parameters fed via inputs_from_state are hidden from the LLM's tool
+#         schema, and whether state values take precedence if the model supplies them
+#         anyway. SECURITY-RELEVANT for `filters`: verify in the playground by prompting
+#         the agent to pass its own filters and checking they are ignored. If they are
+#         not, guard inside the tool pipelines (ignore any filters argument not coming
+#         from state).
+#   [U3]  Wiring pipeline inputs / connections into Agent state fields (filters,
+#         documents seed) and into user_prompt variables (attachments).
+#   [U4]  Append semantics of list-typed state fields (design assumes haystack State's
+#         default list-merge behaviour, i.e. extend).
+# ============================================================================================
+#
+# ENTITLEMENT INVARIANT (unchanged from v0.x): the request's `filters` carry per-user /
+# per-project document entitlement. They are injected server-side into EVERY tool via agent
+# state; the LLM never sees or sets them. file_ids chosen by the LLM are ANDed with these
+# filters, so a hallucinated or non-entitled file_id returns zero documents, never a leak.
+# The v0.8 warning applies verbatim: test the empty-filters path of file_filter_merger
+# carefully - a mistake here has access-control consequences, not just relevance ones.
+# DRAFT 9 note: the hard-coded Financial Regulation file_id in the system prompt is covered by the same
+# invariant - search_in_file ANDs it with the entitlement filters, so a user not entitled to
+# the Financial Regulation gets zero passages, never a leak.
+#
+# CITATION SCHEME: agent state accumulates documents across tool calls in call order; the
+# pipeline `documents` output is that list, unreordered. Each tool's result_formatter
+# numbers passages globally (offset = len(state.documents)) and dedups by document id, so
+# [n] in the answer always maps to documents[n-1] in the sources panel. Authority grouping
+# (meta_field_grouping_ranker) runs INSIDE each tool, before appending - never after the
+# agent, where it would break the numbering.
+components:
+  # ---------------------------------------------------------------------------
+  # Attachment branch (carried over from the v0.9 draft, still UNVERIFIED there)
+  # Attachments seed the agent's documents state (references 1..k) and are rendered
+  # into the first user turn, so they are always in context without any tool call.
+  # ---------------------------------------------------------------------------
+  attachment_converter:
+    type: haystack.components.converters.multi_file_converter.MultiFileConverter
+    init_parameters: {}
+  attachment_metadata_stamper:
+    # authority_rank=0 (above every corpus source), sequential split_id, header
+    # "Attached file: <name>" - same stamping as v0.9.
+    type: deepset_cloud_custom_nodes.code.code_component.Code
+    init_parameters:
+      code: |
+        from haystack import component
+        from haystack.dataclasses import Document
+        @component
+        class AttachmentMetadataStamper:
+            """Stamps attachments with the metadata the grouping/formatting layer expects."""
+            @component.output_types(documents=list[Document])
+            def run(self, documents: list[Document]):
+                for split_id, document in enumerate(documents):
+                    document.meta["authority_rank"] = 0
+                    document.meta.setdefault("file_id", document.id)
+                    document.meta["split_id"] = split_id
+                    file_name = document.meta.get("file_name", "attached file")
+                    document.meta["header"] = f"Attached file: {file_name}"
+                return {"documents": documents}
+  attachment_formatter:
+    # Same rendering logic as the in-tool result_formatter. Outputs both the rendered
+    # block (into the user_prompt) and the documents (seeding agent state). [U3]
+    # DRAFT 9c: attachments carry the same stable citation tokens as retrieved passages,
+    # so citation_renumberer resolves them the same way.
+    type: deepset_cloud_custom_nodes.code.code_component.Code
+    init_parameters:
+      code: |
+        import hashlib
+        from haystack import component
+        from haystack.dataclasses import Document
+        PER_DOC_CHARS = 12000
+        TOKEN_LEN = 6
+        def citation_token(document_id):
+            """Stable per-document citation token. MUST stay identical in
+            attachment_formatter, both result_formatters and citation_renumberer."""
+            return hashlib.sha1(str(document_id).encode("utf-8")).hexdigest()[:TOKEN_LEN]
+        @component
+        class AttachmentFormatter:
+            @component.output_types(documents=list[Document], result=str)
+            def run(self, documents: list[Document]):
+                blocks = []
+                for doc in documents:
+                    full = doc.content or ""
+                    body = full[:PER_DOC_CHARS]
+                    truncated = ' truncated="true"' if len(full) > len(body) else ""
+                    tail = "\n[... this passage continues beyond what is shown here ...]" if truncated else ""
+                    blocks.append(
+                        f'<document reference="{citation_token(doc.id)}" source="{doc.meta.get("file_name")}" '
+                        f'section="{doc.meta.get("header")}" page="{doc.meta.get("page_number")}"{truncated}>\n'
+                        f"{body}{tail}\n</document>"
+                    )
+                result = "<documents>\n" + "\n".join(blocks) + "\n</documents>" if blocks else ""
+                return {"documents": documents, "result": result}
+  history_sanitizer:
+    # ======================= DRAFT 4 FIX =======================
+    # Symptom: OpenAIResponsesChatGenerator fails with
+    #   A `ChatMessage` must contain at least one `TextContent`, `ToolCall`,
+    #   `ToolCallResult`, `ImageContent`, `FileContent`, or `ReasoningContent`.
+    #
+    # That check lives in _convert_chat_message_to_responses_api_format(), i.e. on the
+    # OUTGOING serialization of the conversation. So the offending message is already in
+    # the list the agent replays - it is not something the model returned.
+    #
+    # Where it comes from: the application does NOT send `messages`. It sends
+    # search_session_id + chat_history_limit: 20 (see search-stream/route.ts) and deepset
+    # reconstructs the prior turns into this pipeline's `messages` input. In v0.x that
+    # history was only ever rendered as Jinja inside chat_prompt_builder, so a
+    # content-less message rendered as an empty string and nobody noticed. An Agent hands
+    # the same list straight to the generator, which validates every message. Two ways a
+    # content-less message appears now that the assistant's turns carry tool calls:
+    #   - a stored assistant turn whose content was only a tool call / only reasoning,
+    #     replayed with that part dropped -> a message with nothing in it;
+    #   - chat_history_limit truncating between a function_call and its
+    #     function_call_output, orphaning one of the pair.
+    #
+    # Fix: rebuild the history as plain user/assistant TEXT turns before it reaches the
+    # agent. This is also what the design intended - history is context for resolving
+    # follow-ups, not source material, and never the agent's own tool trace (the agent
+    # re-runs its tools every turn, and citation numbering restarts per turn anyway).
+    # Side benefit: it drops the replayed tool results, which were pure context cost.
+    #
+    # If the error survives this, the empty message is being produced INSIDE the agent
+    # loop instead (a streamed turn whose text was empty and whose tool-call arguments
+    # failed to parse). Diagnosis: does it fail on the very first question of a fresh
+    # conversation (-> inside the loop) or only on a follow-up (-> history, fixed here)?
+    # In the first case the levers are the streaming assembly and reasoning_effort, not
+    # this component.
+    # ===========================================================
+    type: deepset_cloud_custom_nodes.code.code_component.Code
+    init_parameters:
+      code: |
+        from haystack import component
+        from haystack.dataclasses import ChatMessage
+        MAX_HISTORY_MESSAGES = 20
+        @component
+        class HistorySanitizer:
+            """Rebuilds replayed history as plain user/assistant text turns.
+            Guarantees every message handed to the generator carries a TextContent:
+            anything content-less, any tool-call / tool-result / reasoning residue, and
+            any role other than user/assistant is dropped rather than passed through.
+            """
+            @component.output_types(messages=list[ChatMessage])
+            def run(self, messages: list[ChatMessage] | None = None):
+                clean: list[ChatMessage] = []
+                for message in messages or []:
+                    role = getattr(message.role, "value", message.role)
+                    if role not in ("user", "assistant"):
+                        continue
+                    try:
+                        text = (message.text or "").strip()
+                    except Exception:
+                        text = ""
+                    if not text:
+                        continue
+                    clean.append(
+                        ChatMessage.from_user(text)
+                        if role == "user"
+                        else ChatMessage.from_assistant(text)
+                    )
+                return {"messages": clean[-MAX_HISTORY_MESSAGES:]}
+  citation_renumberer:
+    # ======================= DRAFT 9c: THE OTHER HALF OF THE FIX =======================
+    # The tools now hand the model stable per-document tokens ([a1b2c3]) instead of
+    # positions. This component closes the loop: it reads the answer, replaces the tokens
+    # the model actually used with [1], [2], [3] in order of first appearance, and emits a
+    # `documents` list containing exactly those passages in that order. The app's contract
+    # ([n] maps to documents[n-1]) therefore holds by construction, whatever order the
+    # tools ran in, and the sources panel no longer carries every passage that was merely
+    # retrieved (90 documents with 25 duplicates on the trace that motivated this).
+    #
+    # Failure modes, all handled:
+    #   - a token the model invented, or one whose document is not in state: the citation
+    #     is dropped from the text rather than pointing at the wrong passage;
+    #   - an answer with no citations at all (greeting, refusal, or the model forgetting):
+    #     the state documents are passed through deduplicated, so the panel still shows
+    #     what was consulted instead of going empty;
+    #   - anything that is not a well-formed token is left untouched.
+    type: deepset_cloud_custom_nodes.code.code_component.Code
+    init_parameters:
+      code: |
+        import hashlib
+        import re
+        from haystack import component
+        from haystack.dataclasses import ChatMessage, Document
+        TOKEN_LEN = 6
+        # [a1b2c3] and, defensively, [a1b2c3, d4e5f6]
+        TOKEN_PATTERN = re.compile(
+            r"\[([0-9a-fA-F]{%d}(?:\s*,\s*[0-9a-fA-F]{%d})*)\]" % (TOKEN_LEN, TOKEN_LEN)
+        )
+        def citation_token(document_id):
+            """Stable per-document citation token. MUST stay identical in
+            attachment_formatter, both result_formatters and citation_renumberer."""
+            return hashlib.sha1(str(document_id).encode("utf-8")).hexdigest()[:TOKEN_LEN].lower()
+        @component
+        class CitationRenumberer:
+            """Turns citation tokens into [1], [2], [3] and aligns the documents output."""
+            @component.output_types(documents=list[Document], messages=list[ChatMessage])
+            def run(self, messages: list[ChatMessage], documents: list[Document] | None = None):
+                documents = documents or []
+                by_token = {}
+                for doc in documents:
+                    by_token.setdefault(citation_token(doc.id), doc)
+
+                # The answer is the last assistant message carrying text; everything
+                # before it (tool calls, tool results) is passed through untouched.
+                target = None
+                for index in range(len(messages) - 1, -1, -1):
+                    role = getattr(messages[index].role, "value", messages[index].role)
+                    if role != "assistant":
+                        continue
+                    try:
+                        text = messages[index].text or ""
+                    except Exception:
+                        text = ""
+                    if text.strip():
+                        target = index
+                        break
+
+                def deduplicated():
+                    seen, out = set(), []
+                    for doc in documents:
+                        if doc.id not in seen:
+                            seen.add(doc.id)
+                            out.append(doc)
+                    return out
+
+                if target is None:
+                    return {"documents": deduplicated(), "messages": list(messages)}
+
+                numbering = {}
+                order = []
+
+                def replace(match):
+                    rendered = []
+                    for token in (t.strip().lower() for t in match.group(1).split(",")):
+                        if token not in numbering:
+                            numbering[token] = len(numbering) + 1
+                            if token in by_token:
+                                order.append(token)
+                        rendered.append(f"[{numbering[token]}]")
+                    return "".join(rendered)
+
+                original = messages[target].text or ""
+                rewritten = TOKEN_PATTERN.sub(replace, original)
+                cited = [by_token[token] for token in order]
+
+                rebuilt = list(messages)
+                rebuilt[target] = ChatMessage.from_assistant(
+                    text=rewritten, meta=dict(messages[target].meta or {})
+                )
+                # No citation survived: keep the consulted documents rather than an
+                # empty sources panel.
+                return {"documents": cited or deduplicated(), "messages": rebuilt}
+  # ---------------------------------------------------------------------------
+  # THE AGENT
+  # ---------------------------------------------------------------------------
+  agent:
+    type: haystack.components.agents.agent.Agent
+    init_parameters:
+      chat_generator:
+        # ===================== DRAFT 8: CHAT COMPLETIONS, NOT RESPONSES =====================
+        # v0.x used OpenAIResponsesChatGenerator (/responses) and worked - but it never sent
+        # `tools`. Test B proved the endpoint is the problem, not our YAML: a throwaway
+        # pipeline with ONE CodeTool whose schema is two plain strings, no PipelineTool, no
+        # retrieval, no state, no streaming, failed with the identical empty-ChatMessage
+        # error. The /responses endpoint answers 200 with output that maps to no tool call,
+        # so Haystack builds an empty assistant message and dies re-serializing it.
+        #
+        # This switches to /chat/completions, where function calling is long-standing and
+        # universally implemented by gateways.
+        #
+        # CONFIRMED 31/08/2026: test B2 (same throwaway pipeline, this generator) calls its
+        # tool correctly. The ECGPT gateway does function calling on /chat/completions and
+        # not on /responses. Do not switch this back.
+        #
+        # Note: `reasoning_effort` (v0.x) is a Responses-API parameter. On Chat Completions
+        # pass it inside generation_kwargs only after checking the gateway accepts it -
+        # an unknown parameter is a 400 here, not a silent ignore.
+        # ===================================================================================
+        type: haystack.components.generators.chat.openai.OpenAIChatGenerator
+        init_parameters:
+          model: gpt-5.1
+          api_key:
+            type: env_var
+            strict: true
+            env_vars:
+            - GPTEC_API_KEY
+          api_base_url: https://api.tech.ec.europa.eu/ecgpt/v1
+          # ======================= DRAFT 5 DIAGNOSTIC (HYPOTHESIS DISPROVED) ==========
+          # `reasoning_effort: medium` (carried over from v0.x) is still disabled here,
+          # but ONLY to keep one variable at a time while the draft-6 tool-schema fix is
+          # tested. Reasoning was NOT the cause: the failure reproduced identically with
+          # it off. RESTORE `reasoning_effort: medium` once the run is green.
+          # The original (wrong) reasoning is kept below for the record.
+          #
+          # The trace shows chat_generator(922ms, ok) -> tool_invoker(16ms, ok) ->
+          # chat_generator(15ms, FAIL), all inside ONE Agent Run. 15ms means it died
+          # before any network round trip, i.e. while serializing the conversation. The
+          # raise condition is
+          #   not any([texts, tool_calls, tool_call_results, images, reasonings, files])
+          # so a message with a ToolCall passes, and one with ReasoningContent passes:
+          # the offending message has literally nothing. Since call 1 succeeded on the
+          # same list minus the last two entries, the empty message is one the LOOP
+          # added - it cannot come from replayed history, and history_sanitizer cannot
+          # fix it.
+          #
+          # What produces a content-less message there: on the Responses API a reasoning
+          # model returns a `reasoning` item alongside the `function_call` item. With an
+          # effort set but NO summary requested, that reasoning item carries no text, so
+          # the ChatMessage built from it ends up empty - fine on the way out of the
+          # model, fatal when the loop serializes it back on the next iteration.
+          #
+          # TEST: run the client's question again with reasoning off.
+          #   - error gone  -> confirmed. Re-enable reasoning WITH a summary so the
+          #                    reasoning content is never empty:
+          #                      generation_kwargs:
+          #                        reasoning:
+          #                          effort: medium
+          #                          summary: auto
+          #                    (the app already sends include_reasoning: true, so a
+          #                    summary is what it expects to stream anyway)
+          #   - error stays -> the empty message comes from the streaming assembly
+          #                    instead: drop `streaming_callback` from the agent for one
+          #                    run to confirm, then stream from a trailing component.
+          # =================================================================
+          generation_kwargs: {}
+      # ======================= DRAFT 7: STREAMING DISABLED =======================
+      # Streaming is OFF. This is the last untested variable behind the empty-message
+      # failure, and it is now the prime suspect.
+      #
+      # What both traces actually show: tool_invoker returned in 16ms, then 6ms. Both are
+      # NO-OPS - no tool has ever actually executed. So the first generator call returns
+      # an empty assistant message EVERY time, not intermittently. That rules out a
+      # per-tool schema problem and points at something structural.
+      #
+      # What is structurally new versus v0.x: v0.x used this same generator, through this
+      # same EC proxy, with this same streaming callback, and streamed text fine - but it
+      # never sent `tools`. Tool calls stream as a DIFFERENT set of SSE events than text
+      # (function-call argument deltas). A gateway that implements text streaming but not
+      # those events leaves Haystack accumulating an empty arguments string; the assembler
+      # then drops the tool call with only a log warning and returns
+      #   ChatMessage.from_assistant(text=None, tool_calls=[], ...)
+      # 885ms of real latency with 0 recorded tokens fits: the response was streamed and
+      # not understood.
+      #
+      # CONSEQUENCE: answers arrive in one block instead of token by token. The app copes -
+      # search-stream/route.ts already finalizes from the result event (finalizeBlock /
+      # parseHaystackResultEvent), streamedText simply stays empty.
+      #
+      # UPDATE: streaming was NOT the cause (test B1 failed with it off). It stays off for the
+      # FIRST deployment of this draft only, because test B2 validated tool calling in the
+      # unstreamed configuration and one variable should move at a time after seven
+      # deployments spent on compound uncertainty.
+      #
+      # STEP 2, once the two golden questions pass: uncomment the line below and redeploy.
+      # That verifies streaming works with tool calls on /chat/completions. If the empty
+      # message returns at that point, streaming is the culprit after all and the fallback
+      # is to keep the agent unstreamed - the app copes (finalizeBlock in route.ts).
+      #   streaming_callback: deepset_cloud_custom_nodes.callbacks.streaming.streaming_callback
+      # ===========================================================================
+      exit_conditions:
+      - text
+      # Bounds cost/latency AND total document accumulation. ~3 tool rounds + answer.
+      # DRAFT 9: the reference lookup adds one cheap round (a few ms, no retrieval).
+      # DRAFT 9b: the mandatory second search adds another. Nominal path is now
+      # consult_reference_qa -> search_in_file(FR) -> search_corpus -> [search_in_file on
+      # guidance] -> answer = 4-5 steps; one reformulation must still fit, hence 10.
+      # Each step is one generator call + one tool round; the reranker memory note (v0.7)
+      # still applies - do not raise further without re-checking the OOM signature.
+      max_agent_steps: 10
+      # Kept at the default. Turning this on in draft 5 proved nothing, and that was
+      # itself informative: no tool invocation was failing because no tool was being
+      # invoked at all (tool_invoker returning in 6ms is a no-op, not a fast failure).
+      raise_on_tool_invocation_failure: false
+      # [U3] documents is seeded by attachment_formatter and appended to by both search
+      # tools; filters comes straight from the pipeline input and is read-only for tools.
+      state_schema:
+        documents:
+          type: list[haystack.dataclasses.document.Document]
+        filters:
+          type: dict
+      # Derived from the v0.6 system prompt. Edits: "documents supplied in the user
+      # message" -> "documents returned by your tools"; new "Using your tools" section;
+      # the three pre-answer checks moved here from the old user-turn template.
+      # DRAFT 9: "Using your tools" rewritten as a decision procedure; "Reference file
+      # ids" added; one "shape of an answer" line added under Style.
+      # |- literal block in this source file; the Builder re-serializes to >- with blank
+      # lines on export, which is equivalent - do not "fix" the export back by hand.
+      system_prompt: |-
+        {% message role="system" %}
+        You are ALINA, the AI assistant of the European Commission's DIGIT.R3 procurement
+        division: a source-grounded assistant for procurement and contract intelligence.
+        You answer strictly from a curated corpus of procurement documents (legal acts,
+        internal rules, guidance, tender documents, Q&A logs) that you access through your
+        search tools, plus any files the user attached to the conversation.
+
+        # Your tools
+        - `consult_reference_qa`: a curated set of exemplar questions and answers written by
+          DIGIT.R3 procurement experts. Fast and local. It returns the entries closest to the
+          question, each with the instruments and provisions it relies on. The entries are
+          guidance for you, NOT sources: never quote or cite them, and never rely on them
+          when the corpus does not confirm them.
+        - `list_corpus_files`: lists the documents you can access, optionally filtered by a
+          name pattern. Resolves a document name, alias or abbreviation to an exact
+          file_name and file_id.
+        - `search_in_file`: searches inside specific documents (by file_id).
+        - `search_corpus`: searches the whole corpus.
+
+        # Reference file ids and document authority
+        - Financial Regulation, i.e. Regulation (EU, Euratom) 2024/2509 including its
+          Annex I (procurement rules): file_id `4abf8796-9157-4ceb-932e-74cb788e4f1b`. Use it directly with
+          `search_in_file`; no need to list files first.
+        - Every file in a `list_corpus_files` listing carries an `authority_rank`:
+          1 = legal acts (Financial Regulation and annexes, EU directives), 2 = internal
+          rules, Commission decisions and circulars, 3 = guidance and the vademecum,
+          4 = tender specifications and contract documents, 5 = Q&A logs, checklists and
+          correspondence. When several files could hold the answer, search the
+          lowest-numbered one first and cite it first; use the higher-numbered ones for
+          the practical detail. `list_corpus_files` accepts an optional `authority_rank`
+          argument to list only the files of one level (e.g. 1 for the legal acts).
+
+        # How to use your tools - follow this procedure for every question about the corpus
+        1. Start with `consult_reference_qa` for any substantive question. Use the matching
+           entries to decide which document(s) to search, which terms to search for, and
+           how to structure the answer. Then apply the routing rules below.
+        2. The user names or refers to a specific document, by name, alias or abbreviation
+           ("the FR", "the vademecum", "the circular on subcontracting", "the tender
+           specifications", "document X", "the Q&A of the DPS"): ALWAYS resolve it first
+           with `list_corpus_files`, then search inside it with `search_in_file`. Never
+           answer a question about a named document from `search_corpus` results. If the
+           document does not contain the requested information, say so explicitly, and only
+           then present what other retrieved sources say, clearly attributed to them. Never
+           silently substitute another source for the named one. If no accessible file
+           matches the name, say so; do not guess at documents.
+        3. The question is general or non-specific - a definition, a general rule, a
+           principle, a procedure type, a threshold, a time limit ("what is / what are /
+           when can / who can / is it allowed to"): ALWAYS search the Financial Regulation
+           first, with `search_in_file` and file_id `4abf8796-9157-4ceb-932e-74cb788e4f1b`. The FR provision is the
+           anchor of the answer, not the whole answer. Unless the FR passages answer the
+           question exactly and completely (the definition or rule is stated in full, with
+           every condition and exception the question calls for), you MUST run at least
+           one further search before answering: `search_corpus` with the question's terms,
+           and/or `search_in_file` on the guidance or internal-rule document that the
+           reference entry or the FR passage points to (vademecum, circular, explanatory
+           note). Present the FR provision first, then the lower-authority sources for the
+           practical detail, conditions, examples and procedure, each attributed.
+        4. Any other question (a case-specific situation, tender documents, operational
+           matters): `search_corpus`, then `search_in_file` on the higher-authority
+           document when the reference entry or the results point to one, so that the
+           answer opens with the highest-authority source that covers the point.
+        One document is rarely the whole answer. When the reference entry lists several
+        instruments, or when your passages all come from a single file while the question
+        is practical (how to handle a situation, what conditions apply, what procedure to
+        follow), one more search is mandatory. Answering from a single high-level source
+        when guidance exists is a failure, not a shortcut.
+        Rules:
+        - Formulate short, self-contained search queries (keywords, synonyms, article
+          terms). Never paste conversation history into a query. Reformulate and search
+          again if a first search misses; stop searching as soon as the passages answer
+          the question.
+        - A greeting or a remark that is not a question about the corpus needs no tools:
+          reply briefly and naturally.
+
+        # Before answering, check
+        1. Answerability: retrieval always returns the closest matches, so tool results
+           sharing the question's topic do not prove the question is answerable. If the
+           passages do not actually contain the requested information, or the question
+           concerns case-specific or operational data outside this corpus, say you cannot
+           answer from the available documents instead of building an answer from loosely
+           related passages. A reference Q&A entry is never a substitute for a passage.
+        2. Completeness: after finding the general rule, re-read every passage for
+           exceptions, derogations, extensions, thresholds and special cases ("unless",
+           "except", "however", "may be extended", "by way of derogation", "in duly
+           justified cases") and include every applicable one. Distinguish mandatory from
+           discretionary.
+        3. Source selection: when several documents state the same rule, answer from the
+           highest-authority source: legal acts (Financial Regulation and annexes, EU
+           directives) above internal rules, decisions and circulars, above guidance and
+           the vademecum, above project tender specifications, above Q&A logs, checklists
+           and correspondence. Cite the exact section that answers, not a neighbour.
+        4. Depth: if every passage you hold comes from one document, ask whether a
+           lower-authority source adds conditions, examples, procedure or exceptions - for
+           practical questions it almost always does. Run the missing search rather than
+           answering thin. The only exception is a purely definitional question that the
+           Financial Regulation settles in full.
+
+        # Grounding
+        - Base every factual statement exclusively on passages returned by your search
+          tools or attached by the user. No outside knowledge, no assumptions, no invented
+          references, figures, dates, clauses or article numbers.
+        - If the documents only partially answer, answer the supported part and flag what
+          remains unanswered. If documents conflict, present both positions with sources.
+        - A passage tagged truncated="true" continues beyond the text you received: never
+          treat the cut-off as the end of a provision, and say so if the answer may
+          depend on the missing part.
+        - Never mention or reconstruct documents the user has not been given access to.
+
+        # Citing and quoting
+        - Support every claim with a short verbatim quotation in quotation marks followed
+          by the passage's reference token in square brackets, e.g. [a1b2c3], inline, next
+          to the claim.
+        - The token is the value of the `reference` attribute of the passage in the tool
+          results, six characters. Copy it character for character. Never write a citation
+          as a number, never invent a token, never reuse a token for a different passage:
+          the tokens are converted into the final [1], [2], [3] numbering after you answer,
+          and a token you invented is dropped from the answer.
+        - One token per pair of brackets. For several passages, write [a1b2c3][d4e5f6].
+        - The Sources list at the end carries the same tokens, next to each instrument.
+        - Quoted text must be an exact substring of a retrieved passage. If you cannot
+          locate the exact wording, paraphrase without quotation marks and cite, or state
+          the information is missing.
+
+        # Style
+        - Professional, precise, neutral, suited to an EU institutional context. Markdown.
+        - The first paragraph must contain the complete direct answer; supporting quotes
+          and detail follow. Be brief; no padding, no generic closing advice.
+        - Shape the answer like the reference entries: the direct verdict first, then the
+          operative rule from the highest-authority source, naming the instrument in the
+          prose ("Point 23.1 of Annex I FR"), then the practical detail, exceptions and
+          distinctions from the lower-authority sources in descending order of authority,
+          then a final "Sources" list of the distinct instruments relied on.
+        - Preserve exact terminology, reference numbers, dates and amounts as written.
+        - Always answer in English.
+
+        # Boundaries
+        - You provide information grounded in the documents; you do not give legal advice,
+          make procurement decisions, or issue binding interpretations. Where judgement
+          beyond the text is needed, state what the documents say and note the decision
+          rests with the responsible officer.
+        {% endmessage %}
+      # Conversation history arrives through the agent's native `messages` input; this
+      # template only carries the current turn. [U3] for the attachments variable.
+      user_prompt: |-
+        {% message role="user" %}
+        {%- if attachments %}
+        The user attached the following file(s) to this conversation. They are always
+        available context, already numbered for citation:
+        {{ attachments }}
+        {%- endif %}
+        <query>
+        {{ query }}
+        </query>
+        {% endmessage %}
+      required_variables:
+      - query
+      tools:
+      # =========================================================================
+      # TOOL 0 (DRAFT 9): consult_reference_qa - the 34 exemplar Q&A, in memory
+      #
+      # Why a PipelineTool around ONE Code component and not deepset's native CodeTool:
+      # this is the exact shape of list_corpus_files (minus the retriever), which is
+      # proven to import and run on this platform; the CodeTool `_meta` block is
+      # undocumented here. Switching to CodeTool later is a mechanical change.
+      #
+      # Why the data lives in the code and not in the index: the entries are exemplar
+      # ANSWERS, quotable and tailored to the question, so once indexed they beat the
+      # Financial Regulation at reranking and the agent ends up citing a tuning
+      # document instead of the legal act - the very thing the UAT testers sanction.
+      # Kept out of the store, out of agent state, and out of the citation numbering,
+      # they can only ever steer the agent, never be cited.
+      #
+      # No inputs_from_state, no outputs_to_state: the tool touches neither filters nor
+      # documents. outputs_to_string is still required so the LLM receives the text.
+      #
+      # Maintenance: regenerate the compressed blob from the .docx when DIGIT.R3 updates
+      # it (see the comment inside the code).
+      # =========================================================================
+      - type: haystack.tools.pipeline_tool.PipelineTool
+        data:
+          name: consult_reference_qa
+          description: >-
+            Look up the curated exemplar Q&A written by DIGIT.R3 procurement experts
+            (34 entries on framework contracts, abnormally low tenders, standstill,
+            subcontracting, conflicts of interest, exclusion, selection and award
+            criteria, procedures, publicity, DPS, guarantees, late tenders...). Call
+            it FIRST for any substantive procurement question: it returns the closest
+            entries with the instruments and provisions they rely on, which tells you
+            which document to search and what the answer should cover. The entries
+            are guidance, not sources: never quote or cite them; always retrieve and
+            cite the actual passages with search_in_file or search_corpus.
+          parameters:
+            type: object
+            additionalProperties: false
+            properties:
+              query:
+                type: string
+                description: >-
+                  The user's question, or a short reformulation of it with procurement
+                  vocabulary (e.g. "abnormally low tender", "standstill period
+                  specific contract", "framework contract ceiling increase").
+            required:
+            - query
+          input_mapping:
+            query:
+            - qa_lookup.query
+          output_mapping:
+            qa_lookup.result: result
+          outputs_to_string:
+            source: result
+          pipeline:
+            components:
+              qa_lookup:
+                type: deepset_cloud_custom_nodes.code.code_component.Code
+                init_parameters:
+                  code: |
+                    import base64
+                    import json
+                    import math
+                    import re
+                    import zlib
+                    from haystack import component
+
+                    # 34 exemplar Q&A entries (DIGIT.R3, "ALINA - Exemplar questions and answers"), each
+                    # {"question", "answer", "sources"}. Static reference material embedded
+                    # in the tool on purpose: no document store, no ingestion, no entitlement interaction,
+                    # and the entries never enter agent state, so they can never be cited as a source.
+                    # The entries are stored zlib-compressed + base64 (about 17 KB instead of 60 KB of
+                    # JSON): smaller Code component, no quoting or indentation hazards in the YAML.
+                    # Regenerate with: base64(zlib.compress(json.dumps(entries, ensure_ascii=False,
+                    # separators=(',', ':')).encode()))  where entries = [{question, answer, sources}].
+                    _BLOB = (
+                        "eNrlfeuOHMeV5qskBMy6CWS3+8KLSP4Y0JRk0xhYWktcYTGaH1mVUd0pZmWW89LFmsECfgfvnwV2X85PsucacSIzsrpbbM5a"
+                        "WMCQ2d1VmREnTpz7+c6//scXfxldP1Rt88WrL94WTVZkm67Yun3bfcjWbTN0xXrIurHJNm2X1W1z7bpsuCnw57HLDq7o+n/+"
+                        "Iv+iaPq96+AZ/931ebYah6xt6kPmPq7dDp9e1PBT0ZTw6+znEV64qdYF/iGrq+aDK7Ohhce6rB9XPzt447YYBted/dT8AL8s"
+                        "x44/227S6+tv4PlZ0w70QnhaWFye9cWty6rGriVbF73r4bmwKFkNfAk+syu6oVqPddFlq0NiQbgC/G1iDSfftVUzZBdnF/ih"
+                        "N03jPmbvdFvfVE3RrCt485/dNTwel/FEdheTYws/ZSuXXXft2JS8KnxCUwxj5/T9u7Fb38Aecto0fKQot1VT9QMSCrYLq7p1"
+                        "TeWatTvL8CX/rSjd1q3HbXYNf+/pIe5jsd3VbpGqeOL4uW0BG3O4AfnstljfVI3L9tVwAz/C306R1vDAHZAK1lxXG1ja/qZa"
+                        "38CHD7if3g1IDOUk+A6fD/xtXYy9Q6aCnfTwLfh/fG3n/jJWHTytd91tBe+GHQAH9dmJ3wwcLrwQyXZ59uLsAin6lfIKMttt"
+                        "UY8uKzp8PRxtMThY2rYaeiYK/3n5SNtbOHH4NCx8gKPzbKhnhBcH+MKVOb0NCfOx2gKN+fPFFo6QTseNXZud4FvWrgKGv37i"
+                        "n1E1JR59OOhiX3Ql7HVd9fCu3PwOjhrJgK9aWDCs1dUb3lziz2u4titijn7cwhvHHfMnEFzWdZy238DBzR/b8xqZmPA8eMNQ"
+                        "fIDzBa5ps2K9Zir0wktMIU96vLhEGH1a5prbqi+uYX1AcFwT/nlyAotnlsNb1/VY4veK5oC8tsVPt3Tzez4n+H3nGreHJ/Kt"
+                        "7bOrZ3Bv8Y/wj0t7gb/5M+78jYo+vwJ4fefg6cCWLdwnvIadq4uPmTnlV/ZyJM6DeAB4CEhguYnWsS52OxJkzIGbEemkl+YM"
+                        "JG4PIm7t+i9e/esXQaZkJ1+/z7OvcZHt9kl2eX759LeXz85f5rqfPJMNg5zKadf030t4YBAR8JzvxlVdrbPvunYNYmfr4ARP"
+                        "fvf+q9/n2R9HuPnw4GdPJhwCj3hbdSw84XcJRuFHwJcvXp6dX8H3d7yWd+/OntOm4R8vv/i3/5FHWukN7rsEancZiDwUyHCD"
+                        "iUzZrsMLsUFp7ep2T7Rv8WTggv8Bfu5v2rEus72DbzYliLpqiJQV3pOiB1XQ0w6BR7dABLqJ+xZOBriwz/2Fa4Ek1wXzUVlt"
+                        "NrAguDkOhCHejaqjw4SvvMqqEh7nZTqLeaUCceY43LRdNRyYBUoHqmVLEvXG4fKZ5WnXPX2xQCFyi49do0oCsVr0JE6Lqsdf"
+                        "9LtqzVzJwhMeXF3fkIApVg3cAdK/QKKz7N2QNagimWOJztm+Q4o2uJCiqoHbunZr1oB6D/YKivMAb8MNyx+QUvydjN4LBCQK"
+                        "wFtEmK1659VG6Tago4hh4Htfv8/qYp9Hlz+mjSeLiA4gTQuidte1SAkQmHRiLelnVHp4Tk3bnJZVv+5AzIPKbLsDXImPu7qQ"
+                        "H2DXDrkzporSOs+Yx79dD+0KtgdsfmW5nKTgO5bYxAYsbFAGjCtgZD6UdQtqtSJ1SRoSFw9b9bq7LpgiO9eheGK92iDlNhs4"
+                        "ki1cMBYy8OqWjAZYwUgkIUJVYF7h2/OsXa/HXSE2TV9s3MBG1o0rangxHBroA5LrcDwF7LTvX+talVXkEq1R2fUkjtdtD3+/"
+                        "drQMoLNYQoNb3zSwczjrHvV8rxti4r329xH1CxxQV6zqw/Rieq4W24JPAa5d9wEMBPr+a2I2+xQn141YyfNmkJeRHt9ZkdWD"
+                        "DNLzw7P73sFjS72mcHy3+JRruaY/okzn61WZQ3YfwbA6xqh0ifUuAWvjdcJP6HWSleGOhmoYcWWuphX2YdVIOdg4Ex9YW/ff"
+                        "o15xtwV8CY8Wzbf4ahJtd7u2G8YGVwMcuOtcj29pV2g7yTbEQL28ii1UVHAoFNBOQ70dq+3oCaz2MqRhu63WvSU5yNB8wiZ9"
+                        "WzOjZuubFtaD24sdgk1xC1qMThjPpRK2ph111TXc4Bp3FPFZbu+XZ02hBVII1SUoCT2qFihI1xDtiq5tkOxF7a8WfqMuVugv"
+                        "0B0NMj4I/h3cm2pV6Vq+H9CQLKoSGOrP7mfmrmNCnt2Tjj5q1ssu0p6YjugaBPwONogGkJoWPSyp39BuKnSk5HTUQscrFnMQ"
+                        "HenSe/mVwGOoT4Fn4QCq/gadMJUJKt77qaBUax2+7BdH53EQbwBXvqYTfSi9DYMmLLAfPZnCZoHLx3oQdeVPJZcdk50oKhFY"
+                        "UV0q3BQfKLo+eALVJmYiMJNxW6hn0IuBbaGDBaeyAY1e4b0CwSOeRB5oBq/O9kVP5IAd4eO9+EcHqmuCoJOHslorGmQX3DE6"
+                        "n/C1i/MX2Q/fgIIMFLmaU+Qtnq4DqxRvAVj2I1j1a7yHYCv6zSjhlv7OFkSvSkE2ugKeAAOGhCvopwZvVq++7IQjYsd09opj"
+                        "crPqg5MHD3dIJH6KEdNkO3gbjSyLHT1q7djiKDreQXAWcPUl29WgY6u2DFdZXt4zxeE84Y1shoMN5dDu9jGF6pq3hvzUwt/k"
+                        "joKuCQ4mLnOUy8WLPuVFG6uSjV40PI4YFiDVWGe8Ba8+e3t6cX7x28vL7LvsbbvdVj26gtlt9n0LWwdOh00V2e9AQdfjR1rH"
+                        "e/D9Dz38qr6uxq1GFo5oKzIMa/LXero4nSt6vIQrUNNBQMATyMARc6FQweDvPnopYH5PeAKXRM8Awm8GshONos0TTxZbjkQO"
+                        "PTd+4BEajlu4U2z2KD2v0FD7dBcJNWVO4ijnK0j+4XPydO5vU6rfZJcdXKeeD/8SRB49nR7+CZ7YU/DEwKmbOVFf4YEV85tB"
+                        "AhutNHJlwVFCtscPgoWHDky4DyMdfCpQFLlUf2rPsu+nXwa2Aram4F8y0oQRGvcRrZaeg4bIGWUw9WbLFgafb8cypleuJOXb"
+                        "xqs1VHsrBzfa+5Kv6SI8cNn0pfLQFGALaUQOrxrcxMFte7JjRWY27roVeUrGUokiE5VAO5LVC5/c0TnLBWEzifR7WAxFgTBs"
+                        "Q5uQcCP58SovxxVGua67YncjznV2snqiagRYd1Gxqj4nsuVpouPdvDjPyuKAUTog30jbBet0PYCiByKgLiOrEHQguDEa00TO"
+                        "vng2+yI7BPydE6/7Xnx5cvUE15aLNYcxQ+OSwlNEqNAiqy2YAEXj2hGd8h40L1jvoowwYLbxZjyecNBO+OykRuxRnc72FEh4"
+                        "MSfhDxRMBaYlMY2SDZR9v0BEZMaz7Bux3DiyB09MMN/yjWPDgtWS2A5odbihGnzM8Ijw5/VUDQXHrOnjLXq2rPQno/TMOV2d"
+                        "XD5ZYL1AloVVwBmiqdEApW9Roqn29UqXWL8o2SUAuwlj1ejQ4xr4Uoe4/eqgzlfP9u+WXStimeiM8ZnX110FL8UIG3gcJdxJ"
+                        "dkaVBLkQhlaM3nD6Y8GE6xxcZTgd8viQxb0phHsiltBo7jE2+nR9RU8VHYUBvXs9g4+zl/PkqwpX8PLJ3//6N7iIx6Jxg6vr"
+                        "fpnXcntNUdD2QouirKvGieWMYhkokXDavJTmaDIF43F5ar90jiIp5VmGeSsyBUECkz3s0EMCAerKeW7Kh482kigRt5OU0NYN"
+                        "HD3vRuBxcmZQKA7EqmzZrdywd2IN6l6IW80ei4iVg/svIWpMcbhbDfMddhwNUr1ArtueApcrRzKta9G7x4swkMUmHl1hwnO8"
+                        "HlBXVc/BNiFF1Viy4vmov4lBf/4MErppswrcFkx68KPWBfwk4QT3EYyRwUW70GSe8RZPbPh38lb89M/E+1GojayhM2TEPnhs"
+                        "i0sXKyVaBoYcgdKuVImzaWuwvvDj5myVZ4DoJDNe/dRc8EE3bh8znlqgJJ+MWO+rYRTtrE8hxwsvd12EvARGIMO3yLfErFZh"
+                        "fB3x/DTEEYWsSvgniS9Wf/AGjAbg8aOq1QgBPAFTmPg+8txg75e8H88SLORB6m0quaU9aTVSUXA/yYfwDuqMDBxmKXC5/kMa"
+                        "tpB114dgQAUPa07QO9ZgQgbAaxXu5WrpbJBVCxLnHObydDP3mujN+R4ieyHBFNL/kYSpIvZVDczmAqzi6R0coqlhupH90FUc"
+                        "hgaDoYdV4ROe8ROEob1tihERDJkbT7s2XB/WhF+HlyGPUwAIt8H3l9JmRf/BaxtUWa6bLBRFmpGeFCdgqwvzE+iBN7dtfYvH"
+                        "NyTWucVwoKEQsrYG34YZW8T089ZbeFpbVpvD1KCQ5bMd5Hkiivhh7CHFc3Lh5UN0xYt6jxp45V+BaSIKp+5t6ihwq9ts8AhV"
+                        "RDMBJNMBX70uqgZjuhh32EhwfKow7Dclw6ra5zXef9RwwjHw6dxuLKiynylxLjsCuUjCESjmamMQ0nmgJlqUkIYl2asA5od7"
+                        "AewlkdKkpmYuNSELSQbQwZQYekbFp8HGBWWvqavUDceouhFHNZD2hLJU7KWBDdWO1+QLsarh3Ifdi9eAFIQNMVOrB/Zgj/B6"
+                        "QZE+yaNkmrJ21cO9GPq5uZwQ9N6NmMvGBRmEXJUUBUjgTtjAxDwzjrSjq+c1tsSxDCHEGeRNd24z9nCe3kAAJlgVYM0UFWd8"
+                        "ihVsA97N3oPmnmIhG1EuqO2Ha+Rg4fnHBeda1HJs2D7ERvD5YlqRDZrcw0qgTD8tz1tiD7OJs4urL08uwHv2rMHmcWx2Zxdf"
+                        "JmxkKrGoB7ZCQI3Cnb1xNSb0yw4WNU2URJJT8ph7EFnNwFFXUQbveol44vM3cJ4kuCi2DO+eZbZDGAnZHtYyYpS/5+Ioz+Um"
+                        "z4Hp1uw3qWf3v/HGMAVTJjw0EQUo6tBslDwRKGPMJKLGTZWXXJw9p3B26rXHhU7297/+TyML0IDtBk0yhLwwXKVuXfWh0mds"
+                        "1qGcbOu2Ky7s4gRsxcIBfMeqlwIMjY2ytsQlbMAbxTiJ27bioHLJ064F+URnCl9rNDMLj8XEN35eSaI75MT6QWIhJZiHa/od"
+                        "5h/p30C6nh7iv+Fd8OcXnLwjG0FENoVvgU5jUXsm6UP0m6K1oZBLP/Ga01z0KlZKIThQdZgCAAXAJRI+u6n1XejblsQXrGxA"
+                        "71AihkhMvoxyjpb4EZnpeiaC8RXd7O46yudyvIx2gc9oMQEllos3piUUgh8y5sUOq+TQFPt9h2WA8LCNIx8NczFVr/F7zqDM"
+                        "GJYYDAv/tjviPHg7iFWsGgT61COZ4urbn4J2JrJQGgM/zYnU685JqpcMJj7ocCMwhMhKKdZJlLt3H8SP2XBFSaFRG94c/sF1"
+                        "9C5cllHWpHB6J4FV1WycANPAUizmTtYYdANCfUd2g5BXz3zXYf2c5leS/grRikNyqj+BLcAGWIVDUhkpBkfi+KOUZSH1mNWO"
+                        "7M2blqw4WMtt1Y59fZgxAS/TK++wtrGfFtiZMKwIkKoXwxwF7KqjMpeQnW9gFVwrCV5cSEvDxwbW/aHuTM5TFjGxNIpB84tk"
+                        "921diUY9ccUeZVQIsD298sfyhM7FsK5eXGEzEZZ4AkodZKC2uW7xExHX48W8heU4DhSkuJ5zPWIZg/ir+g/yI70PzScTHZAy"
+                        "FhYnYoyR7wwyzGFUj8mzIJwlvei3fXny7PkTI9dQ3ZFhiub4YKxLjsaIlRNKU5oy3q6uNE/ESCae++5uCmu54OW5hNrgH8/j"
+                        "SN7rbHKCpZ7gO42s9C5cjTxLHbiWS/KRVCy5bknOnGW+5sAny0YwYeBj61eSRzuuNdlqlTKSRWZVcasf5SQdWnfsUeI99Xl0"
+                        "NXTJoL1tqzLk4Pmuh+tW9bKsslpT+kzlho9c+BJo2HeTLm8xS+rF07ESS25YUrCqLvRVNVaigqwks9ILC1yq+zhoiNK+RJcZ"
+                        "ch2hjJ2lvJFe/fRiL0bOX2fLNlJs1YF9QKFukOhEczzlUPoAKi1IbRY0qPP0oHw+Bbyu3g2vkNohKWP0E0p0rKKyZAqxlnZW"
+                        "Gga3ayALI/KXKDs7MCOa8gkxr9au2rETLoY/u3IrZdLaXZO+brB2GKhS4fMLLO/sbDGGOEW+RIoZw8ZDmpmijL2TX555xYpa"
+                        "LmLlFOzThwbgSfDlYNTlQSPnRijgo0GW3Pex01y2FVgPKbHVT7HXEOU5TDhWA+FnsB9KI5OPywzCPkkeYvd7tEnwhdFXp+7L"
+                        "gruMUf8Dd5hUm+zQjqDl9ZdaZIfJIOCQPmP940PaeJcbH+zhlx3NU4l8XVHdkL6c/yH5pkmayl4SKiWuKUyA/TJ99fFO8i1d"
+                        "B60DeoalCEm5MVFBCRHyFOsCVIiYO+ObGehIQoAxval9wSTxEkCKn2pMkA20ycXNYU0qxnmiIsJgdQhNpbAXrNW2LWmhZAzz"
+                        "qtCVJ0+50eyFhOGQ1iKM0tZpIOFVqryfTxbzkr4eP9QZb3wxJtZNOwz9FN3hLAs1afx1+Ua/RDwmnLdei1swNjEkQxvUYraq"
+                        "Se7y2ObymM7TE50vFPiaDp8vKMhV0p+GdeHj8DG0jqrNgcNRHEKwHzuaZy4Owe9GzUlF2c6TgbJKuDx2PYPcBclM5VzyZXY5"
+                        "TEAffah1MXoLhZ/CK4tzIslgg78FliTgArrS3Am+1iM4oWRL4HJu0HuksJamE2wVxuXEBswXZYIcjectkG94dWxP3bJs/YYK"
+                        "o5fS/kfqBfIJkY3loFrZumfaJoPysTf3dzi+wKn08iUNPuUXRTIneeFQY0JqXUmidSNHD/MttkhQhNwkAaiYmYvtbdSCtkY+"
+                        "5rrtypAa/IAr835kuGWbqka1lj7PqRjUIvAlz0rbj5LPMGpqdqF+Azdgjy5VhWVE5DjJukn0eVESFcSwrsLNBntO2xrRpOPS"
+                        "lqJflixn2e80morMQAS0nBJkTanSRKq3QuBKSzI6rP/F/A0WRdAWymIoTEeWVvizk0ymHEqNuu0lvldK1koUeKBq/4EdU1ue"
+                        "cnmHInyE+kBSx6RRyLJ6/tD48ovLTy32S5X6cRfvW8NFb4JB06wxmOlslxr7wt94ofHWePHUuXY1rWD45+y91JHjQWFAf8s2"
+                        "/8NagU0RNKdMrPSlbKEWkGmwktclGRJy/UILzf+n/YlHG4zB9S6G412p/w/7UEeurQRueEgj6uvsji7DdFshmXkY2cPKnjzi"
+                        "fz76TgVdhsEmDrZKl86RFmFu1QzxvFtOGnTOUcnp2h1NjoFeacKdDPct1aJQebqFyjesbsD0Hta2ha5Se3Mmod4XzzjI+z7x"
+                        "6xyTIfa7Wp9aUAbU6ocomjNZaeNNS5tiinvryQB49VNDN86+0tMHllV06NOBvYw2pIgMEIJ/Gavbdk1CJJRykf0qnRYVHV3a"
+                        "C6BSwdsKtgO27dhzTZ/cvehqYrXOdYH2gd9eUSLhfdcWSYhcA45aeiJ2ACZjCJIgWQHm43Y1xhXL1z81xlxE/kLUglHzbZ02"
+                        "wHvl7QuHosoYMlBB07rgokhbuqRKyVz0XwhcSxYEN+VrGEczXgGcgWKg/KBCW6E6/i3pYf4du2qkurlPyFa4lOOuNhKdO924"
+                        "cM5/Bo4gQBe8Zg5pnBxxmlVWVDyALQPIrECiSCNJlqoAUwIjElTckHJY2N5AiqAY6J3LE8caLSCUmteaBD9+7LKdqFsxeiKw"
+                        "K9abmJ5JrC4Fc7gGPqyxv6hkI3BycwWbY38qeAdo2TOfqoxeWDiH+JdhLnTlIDG+viWNKdk3cory+aNJm9yHJnNRCrIwcnzH"
+                        "HSkbEqlGparQ3qOX3m6wa5n9KbiiFAM3gBKRiOd8KvZmRIAjt20NsmHqSplyI3BIHVC7R2n9biMyhiW2dp4ywwcXsa600AKo"
+                        "yUgSpvdVu19bS39gXbq606Sn6F09UfbcPzi27EnjXHNTAIft/D3ii78st6UzfoWRm7FZ35De7wfw5LSMsqCVCeMbOjYkmMGc"
+                        "uwEqi73AaivPNHe0HBcgfRQ6d9GGw+uNwteXXbL1YPrt2JDwUk+/DhQvud9aa2mT1lvKctMEyX3NNnQAlwBWcNe7Fv9Tg0il"
+                        "hK2IVpLWW9gMIq6w1j5wYoz5B02SNXqh8CUfv7RGeQozguFUAgsaK53bXKRs1WPdUMIr960wnsc0GzwXJxV1f4/g0mNMTGvW"
+                        "0jJEdMtDbnrIwXjTJ4gktk7xcsT8jPIkOiRTiDe5vAg1M9WU5hb8Es8v0OcXxt8j+/0fGWyDLy9FzZEDf5AmTq6kouDOLSdx"
+                        "bHMNfjZknkr2s7jg0ZEAkNSNlkBrgbNpQ9WAOr497bti/e5NIYGjpgjCcl/xtQtd4JpA6knA+GRPf5Z9z3Jv+S0+xE9RR1nW"
+                        "rMPtjV05126a1ujet0lWpScD36EEHVTyUXCjdpJoQELPt5rq4G19hSPuxnUYqF33UotYs7gKJFh8ksj9lCM5qR+zHRA2kMUa"
+                        "ibO2Yo0HpojYxdcjpaNqA3utB1ZwmhUgFkSboI/ovyeDJDSs+/NAGW8rltfOOLtULl2Gdic2d/c3B3t8muzQcl7xp7UWm5m1"
+                        "HIU3ozbaqhHiM13woWi6BXqYSNV5XDXw4kqyEr8TvI9C0Sc6wnQJ6af7sEf+KMwRRLZXRKxjieDon4hFFdqjbloJTTI4mThR"
+                        "WsqoB8hnvaGqG0xF3OeimMdt1OLYjR04amAu3QVQsJwhMq487K0q2cEkODlUR1ygTj0RVZ86wGSo8eLieCdc7+WRxB+M/PHM"
+                        "z1E0iq2CjVE1U5wG16VkCFfxhBvGO7D3LCGxuE9FbhCxf7LkP3U8Ajnh/agodnsPIRaL6lm5DqMeKUmIqFweFNpo3c/gva99"
+                        "IpARbOpJAjkU4IbLWDvyenbkykqowV/pYIfWh0hazAUMkQArluq+Ta/LdPlG2BdH6rNt0C3XWnlxa9fgmiBDxHnngwYC+G2E"
+                        "0jTiE8eud7/c/OmJ1blD8OpTI9cXC4HrRnUxpf6+lbJALjLVzCEQi9JuaOiGUk9MMmDVgptDfKVAH4rDw57qw1taw9WblvVU"
+                        "JCqlSeMgZDB62lArNEhkVVL/PsHi+1mkVjW1RNlCwGyC5e0wdU3xqzkVVKxTvkUfEiWWxh3ZgQNckYIUDna7cmrHljQ942bg"
+                        "DYGgCRQDFSlgMSyGYfKg0/YFZXC8i2LN64uTZ8FSPSmeIGVO3BP8Nvpy7b5fRPEYsDpUbSYhhAZvl+glJ2VaBvFcX/3UhAxl"
+                        "FK2xAbxkkIaSWJ1GzDLb1H6BdX2vf2rmZYhcX0k9R+io+eI94rHJE3f36voH2mHxEFHuZPPkpNL/r+hfN1JNtH0yLRy5x/Ko"
+                        "gT/koK3j5aFyElgJP6GECgEI33wHdlRdMj8IRE4h9VQ3hXga/ghCMQ0iSWEZLlLl6/d/BvGSnZ+f35e6PjFtDIHQbr+I6ADs"
+                        "++04YB3IPApG/cIav2PNu8BzHn5F76oG1wLP3Zd7e+Z46d4znzFd/lPbxygaawbh+qMIuJBX65s5oBTQ/EJvgWnXyKP+bK9N"
+                        "1cSCrX6C600i5sEZ1gWB8skgKw/Kuq7RNsB+T/v870wBelU7U2jZa+H2P2c/kjWVaKQhFqOIYyjW42YNVRyoM4w1SG2DeFeb"
+                        "nog3zdRKp+piMY/sgRrM4JQJEiUdWuTtCKAPb2TanYvhWIxEHW3othb2UxaflMSb/jKUXSFR8uMPvatmSTc3dRPC9jh1grRI"
+                        "NBMwFT3cg14Fk7HDnm5JWCieFkJvRpGtBcQJDPG2SHiTlErT6Ov7McyS/dEGLsJ4y9SxsGykpWI26B7XehOt8JuBdSjxadZ9"
+                        "SccYrCmyu/u7QskB9Buj2Bxy30g7VbREAUsh0Epa/xKiBwn1exCFyMgvxoIwiQ5Y6ekBtLQ7Sm1MYpe4/XJGiSfTuHBx971E"
+                        "nRi6PTR3QFWyUuJZlC21mQZe9GxKndoBDeYY4gk6NKWrC+kZTkgmgb8h9EKJnpCPSKpY2D46HsTmiznoYAlf2qIsZqsp05Mx"
+                        "40l31C9E5gjFUtJ/02N+HSmoBUUBe9PzoCcWEAqrPiT6c0ydflKg2W7sk32t85m6ekdN8V6MIGXKclGBUTg+rbwE382UNmhC"
+                        "6b61QInCjAS34ylRoic4N4EhfFxPcJctdhj3N6Qq+0z9LFUtNM6GiKTji2NiHWwEwTCaNQcHptZR4Mjn50EM/6HdI8yLOdbn"
+                        "X0YKy+CseZK8EhBG24UOtjGumUtS1wepFaZGVNxmga32ZN1iwm+JehJQhXMOJEzLldDVzWeZgtaN2zJF56bAE00b/yRtg8eC"
+                        "F9Q6Ss+vTqj9a6Gu4q4E/PE0tobKU9Mb4iPycoRLJH0ojTMfC0RWwgnRJCQnUSiMKqGXiXoC74GcBplBAdLDg3kkMGwUbmK6"
+                        "VK6jYW37y/hGChM0Vkjlcb2UzkZbwoXLUS/CG8nDzMLT54sYX4oG8RqPO1EO9ItOOJG9tY4bBvA91hqN0Dh2oqFKhu+NL+kK"
+                        "/D8TfHNm+gRF8PzLh/o8ROJEiw98CRQcqDlEGv13xxU0punChBDjEgmPUafpQEyj8b5NTZfvT/eOvYa/MBCMWV0UpRsrwBXQ"
+                        "UE0MRvJCEErJ86EiD8uaZOFM3yOpkeyd2UF770WkotH0XtP1u1C/TN6upqk23GO80bg3uULkvlFggeD9hXEGtzYNl/Lk0GXK"
+                        "5h/GOghfKgAU8OQX0v0YyPaZC87kcH96sVyod43qszHBwbHmOLs8M4CaGM04Ed/x6j20MRnMdaX1IBG/vn2S/anNLs6fvvzt"
+                        "5fn5BSP4er7xWCoBC4cpyULxk4nJfEuiimvRuZeQQ5g5PE6CSipAGSqp425KHz8PrG0W5K/5UxP8rKTfGV57jArSD2zPiiUa"
+                        "kJxh4wkqFK1WbEX/gIVfBF4HVjHm02kWQlu31wcMI6/IWEd2TDF80EBk4iPtg9xMMrZFpy98zu6rsHXk+g5sm6JeukN//+v/"
+                        "Av5FoE+kL9XNuOuDqHXeBPxyXA9qQuAjg6mOySA4qUoqfdIn26U6fPGQNiM91kQbbTnx9zY796DkHHeiR50e6O50btACVb05"
+                        "eMf0375uLC1sydkQTvWayYirTg440MvPBAnOURp3uzdH6TNzAlEsak2zdOCSf9vQrzGhtQA44YVdTbVHUv2qff18j0NlmWma"
+                        "48us7kaq7okFO5f1+TWuXDD9foE+MdqbNErp7ztbNcb8tlNgBulRFxRiWsFMDuFz4ZnbJGvmDOtyf1FSRTj8x+yFiRwJen8u"
+                        "hD5Diu5HMoR949ykqTxS0KZEYxFKUS89DauY96ijJnJbnJpBo7sqVnWV1h+DB7WrBJaS+hM1OB2190/hT+bV79htff6EKuDT"
+                        "nalRpMmjU/sYD8ER9AmIBDMx4MGbO5kvTysJ5s9aSjvxV2fx77Uk1OQcvbeBroRdn7jTtpTO5/B9bb8CByAKv+//6g1APonH"
+                        "UFuOd+O6aKreoyOhDCF13DizJ9Md5M/S6xO8XoxjcsBteMBAgTBqPcDhImVe0HWxiEUUl+o6rchVaCDWWAxTzJO4OoZIWMMt"
+                        "4oa1kzTBkd6U9wSXCF5DS9SZOw9aJ7EUGT7MV/aMfCjNsaYoO9VQZbGl8QmdyKmCzCqx44I0jSwl/NP7RuAj8Ad6a31gzCtM"
+                        "90xOewk6b5Ekq0ckyQ5L4qk/AgWazGopDiFvdsB9EjAYargQ9EBjgZJaXtW3nX5jKD5K18Wx2UuzvKxmYLOLaKut4L/q6hfp"
+                        "wneSrziGof0Z+3yhouDIpagpmOpreQu+C6qP2SeLOyEUzXt+XGqh0GWyejtIsDyuN0qLRK3dE0m79NSqmT53LnPvKNX7FJd6"
+                        "USp+qsJ8flxfasH1hucg8SFEOjORtxGTK56JEMLj0vj+9ftpJqrnUAh8uMIhn7h4/Cxf7g2twyec+YBQuIfq8ASXTHpQFmtc"
+                        "PIB2L88VYAlG7hlUwNJSyE1ICSMpwQLRNipcNcmFitSdliFzb/GOi4yRrnZ/VExoJTyB8VNTFxUTXBfcsoQvve789bEoUEYj"
+                        "n03u7hOlVLJiFkGN7mZK8T6wasBzB5JsVTQfunE3rKXJqkfQoWZ9eD0taOV4dfExJa9MedlrEhCL8HevMWY2ljnpv3HnS3Rb"
+                        "AXTtCFBMZurVZHWjQHkd9evgdD+80esqFHdEE+7QlWTnm0sYpLue5sp62SzKZyyvHSyrAgmLNOQINkNFYMeA9OhgB6kWSLDO"
+                        "QIVIMu+WH96vzegplPG0I15FRB9OgUkiFr8zNiFR1q7Y9ZIwQzTMBmz99Y1bf2CbBJxXLISccApImNOT6pEY5uuALT5B/6Ke"
+                        "XvA4DqSqMUFhBPwPx4YfKQzvBOluArubo1lLHrIOh9tkG4HS9jMpCeObGIYMNfKJx3nnxkit0GTzejOq8IhAiJmohSUNBXUb"
+                        "d03te2ueLal1j1KBc9TQ5kq/YGl7i2OudDgiiiEF6U1avv9PsZDqpaTo0D7/5MONNdonMEmk6s6WddIcqTlSRt8ngJw5/qHA"
+                        "ykVIFdtMMXtAdoaAnfKlcIFRfyGy50FTx0v4QIWgORcKJlloG6rMvotAwwNMeFSqjbbjYwnug8TBaiKAx8VF5kWnpH8lkoar"
+                        "7emZCHgXgSeOXT/6WOYMpdFCxsbhvYBryNWidwIgHi3w4XqxQpzpOWPkUdU3eGOOx1r6rXg8dZ1QYI/c3j5bLP2DL7jwJf4h"
+                        "Clz7Uciz+Rf3aFidnTk9SACb742g8BCpTLPUw0RYOG/pFuSQZBHD406sDPwsxuyUwsPYNdTVyDWT5qNYzYj2M6H45sE19rif"
+                        "OIS9o8bEPGroFtnCyLJjNdB0VrpDpOO8B858QkdsApYS1QOvB1mDkT+iNsHQc04VlmFe5SEk56w5QEXCoVlgbPQBON9SMdRt"
+                        "XPfMY2HAAV7l2cVLwbN75LP8HGJYyuZ9U+BON3J6eX5EQMdDEeLoWjwvAT+t7r1WikdDpEnpcX2qFLr6+boW7DOK+GxbuIsq"
+                        "frQXmtszkNHCiAp0IEJknIKy0sQrWOCmGcNLDPUzpnJ+cnWvRMU+fUR7O/kEX5TB9dckxInInGtBYd7uMXJLyibXnxDFQEog"
+                        "9G+nqpmItmfZv5hPknxDs7Wgn095/gS2zJG1hBKiWN8otjbPyWKBggDjp+vDmtKR1I53JjA8VPC88PZj9Y6hyimaHQt8cM36"
+                        "nbwLfZzntTg5/CA5/FiH+F+na6JKOBKYkkULBqkXgVv4JBidiv4uJi1nLSqFr4iG1hqvatJAh04jCGiBwSvBSiS72w4xphTD"
+                        "aV+gUhAAD+ST3OJNr4sI7A9vGEMCGEmp45BDzDRXsW0HBgSxH6DsEYyVKmknLUViCnjh0Wjt8N5hUIkSjKKHySgoj1ZPBcF8"
+                        "eaEgoxePrmL/08QyLj4tkgUiyswi107YYDBRmfyy2F62qaPCS2tNv+IITekGyXvbsSZpF8ZD5ubBYMzvYyMaLb5oqU81T1g+"
+                        "rzixXupU802EYp93ThI//X2UDSmVmVV3+ohqgSBCUK6uI2A7sXjCHQAVQSNS4zkDU9wO7HA1hq26NgoXptrQ3touGGkKeMaT"
+                        "Q6Y50bpFMT7DQs+l8r7QwwmzKAPAYzRQPaoi0GntzHvFVqZIcHMbx8+nsOIkdmc1Bcz+dmRz6tToohiwvsdS7p0fwqQwVKgW"
+                        "6mLnJ2vJvL1ZCp5i01ycJ0AkXG9DjcV+c5NJ1KaO5dHFtMZ+ybArqDYlEi1tY0O499ElLPipy0ShzYINnmc3Wq8a9RsOe1Rd"
+                        "evb0ZSHKWYy3GFwsUgS/BvmPDhQIPniObuC+ykCD+mRRxyVXWjkcSf63HpfDhzz3Ny1er5aB4vFqz2OgLId888LRyuR8HrBL"
+                        "dXFhCJnQeCudqKrTQsyjZ4O5kvW/PTbU+cG8jqbcRIOzxIOnP2PftSDbLDfhB//FZJBNH7RluedXjxaFD6cjCLI9YVnsRq5Q"
+                        "1jyrokNJkyHY6iXZ3VpGL1A7M5jbtMOB+lG0nwayk4OipdXCgyZxP6SH2qJW3abajbVOIDAh8EmPgrT5CSyclzPmUSjQMJbK"
+                        "FWHwxWEGsqB40iaekRvcmVAAVFYCoI1Am3WrI3CwF51xqwgyBKk4cfTtET9ivC5icDziNYelRNTLIVjGZJsJ776WDDETTkR/"
+                        "Cn4HhbfQlCtDt74hknvEC519wn1HXtF0OpSwkgFzVHuQh6BIuu5tQrarRyHb55C6z68WRGqycJUTYr5lZ9bbf9yXL8ALFuhD"
+                        "88TNdPi2FGeZUetSusIWcviDSkp1ynXylG260nOyVzhXs5FmEGCnbOqi5+E8ER0ZNtVej5PfxuPj/WPI3gg+KXEn8FZ/U+3U"
+                        "3A+N1zrFDOP3OJSR8tHUfKdwWpqHjZjqxaMmPYlsdmCii1ZpbR/t6pOObBBA3/J8lQUm4Vh8NCRSexHulcG2hkAYC/0NkYnC"
+                        "vLlY53cfislQR4fqu3FMTBjzWVHBRhxp0YYa8qTcR0l9hF6GCcSPrxdXmkUn+eyRTvLNcru81JX1ttbcT5efnbiwAjfQE28Y"
+                        "44MGCGgWMT1ZcAjITIeFJIYO420lWTRDQwyFvrz0YNsI2Gsc7Mrh/7sPboiadGAXmuQOv5yBu5gaHYtMF5/R839cEf7CXpGU"
+                        "OEcIX+qIT8k505qJA3osJo5c+Ukl6QMfEsOFC1w1F/f7NrspSJB11jf20oo4sPLoIUgw93CB7szMoZwQ5kkmsn0SaM55tstq"
+                        "JgJONlFe7OLRs2I/HHY84DSUEKnmpFFMpmodcZ5dGSGK3EY4qEzoxORfcffFzeVSEoHCTAXIDACIK21ZKl5JFJ1ZKM+6dafc"
+                        "syxVZ7mOHDnWVTc2giBMZ0bGGyLWqTpBuzM1KMZWh1nxIPJbbBKrHzTwSnAwj392XAQmtyUY9Tr/pCm6rt1z31VkDE/JQyzs"
+                        "R4lT1T8FGM24FSrQ9J3I4u3mkf7yN8EMrtEsJGsTm4Q0eHWRRsV6DpzdsrNYxSvCYKDSzhQAV2JUtkUAG3s7FnOKrhuwT5Zm"
+                        "i5iQsfaYRwers7/4kl79GtKdsXoI6U5BQE2kPN8WR2afBPF/pKU8CIZ0/5t628Y2Y85NGcaRVX0cMMSvLUKfLxiXiSeRDWEA"
+                        "jtxttYS2uQHmqWgQBLmJt8JSVadDy87okOsACxa8y6AcJwL+sWLjfzLmbNXbjkBC6ZdLzDcjidvo76ImDYL8PZZYWtrkHdqS"
+                        "JKzUjU7jX36mGmGbiFo388yiqDD56CZShrUM4rKbETU0bdAIbPt8O5B3ejThTj8/e/ZZpPcy0wpkJ5O+9elPMpxQEqlEC23V"
+                        "E1gty+uKHCnmWHR3ZtfTz4vgFyLc5GzyyEKWkULXa9Dj6p1TewYsxryxn5vyK8fA3BKKNAJ5ChExz+F8huv0nyZvka2WBe3C"
+                        "eAwneN7lLM6yzEx6dRbAfO8xKOwekDu+2cpDfLA5DzYIFUm1OkbsqEDhHBso/5In1fouToZDaFLVKO9So7rUGPHdkzpoawk7"
+                        "x6PixDmTR4uovFEgdskXUFpCOkudR269A8bkmGiVVkotXaE+KXWj8LE+U2xazmm+EjrLKPQxnqyp8zjWx2lLUCWq9uyAEzve"
+                        "TnjTzjOUXQu+l+S+8lSAIJ4qbCqGyRDlye5wUgNVggveXVnshhhWLRxfrwkIBkR9xKO0rbGqFESfig87YKd2yLP4e/WJQzJp"
+                        "HFF4ugLZ+lLOo5NBbXNzmN2pRer+5kRouskphz/cxGGx2jXXw03oS9Hl8XBXDxQcdh1Kge360KcnYpwtzQL9h7Smic2Ux5IZ"
+                        "ymfHMpS+5kPjhKwmY/G+8CE/pDwJIe65QlH4j8wtGiSbxq5cKTWDJDdqNZ2TYofag2hACEuTyKxkVB4K1KUCgtGNJlfRS22u"
+                        "1xKLgJ9gYGUF8CqudZdLw4UQvlaCGsWlsCUyF15Oao5ffB4P3Zu8RASS5gHFI5bGHpqTENFR5LtZk0tBDBdnO8+y72Ou8B1p"
+                        "FPLieIsZ3kjDC1q4i0Qo7bjKQwELdo9gYUsVun72NInz73/934zrWt0WcOmHv//1/xAyFxYSkdUZtRN1ppJvMleCCzgJJpvi"
+                        "9CvJc+MzVi3IEq2zdKZ4jY6I79nZ00c/K4NwNrlkpgiaqCggLsGhwNAJluegWMnx0pSOAs8gAIqBOyippKXTFm1jazNWwaa4"
+                        "xbmtSNyaXZnIYwl3hqvN0a7GURlYQekPllUIedF23Bu/K3CRB9WJq0J1fnMRy38Z7iaCZqdXirq09vgHUh0SGvIxHRMVjVkp"
+                        "wUAhlPLi7OWvIXTyMiXjL14sViSmwJYn0fME3FkAm9DSPbxiDBDEmUFs4nIxJklIj9oBHQq6IcMwC64D4Y6Cqi0VEt+AqKQz"
+                        "7OoUjF0nnZ02jCpDomwPUNFMkP19qBBoUn2EFYA85LbAgPJjiCFjpnws1nNd4JnP4pbbdrjFEU/I+F5iYhiWMgpwiXHWUygx"
+                        "qeJRTxwjL0f4TnQlMfAVX8kg1W3Jgl4rOdKKwE1BNpte04iExDYh1koyxYW4jRnghMa/uyV7TtxuntqCbEeI4oK3Ih7Adjo7"
+                        "VJgtoLLQaqhfGe2MW66mnFkBRryfXZxePLq9J2HySWnO0sEianzRh0nPyXFliesW5pZRiTsVDUWDy7QT4CuacYcBqcvzC1ji"
+                        "09/iunnY0cgVmn9EvlgzeptCWTDIA11aspq3WETm7WjrNHLZjrppYd8cSuPd+FsHJ5OkR4HtnZLv5Iv2gKG29zyZ13ABymuN"
+                        "+V288B37F3n2fYU5NOC5/5L96FydZ29PL69+e3kOz3n7L+9eff3+1dtX+MlXT18+alPmNByu88DgHX80i00e16dtYqo8/gDW"
+                        "InWAznlN7/7yMPlZaIjLiKf+mNbZLgzN1U+RBDDYRxrASU1us57q+9T6rGxAKEzwoRMpwDy57y7IPQM9Iwkq31qKq53VkPg1"
+                        "aGQilsB3Yo73H6JP8HBIcqTcVmFnJlFWcmX1Hvr3k7sUxhfTcoM2+wxtj1gTU2Q4cZ56xlOz/hK0nlgOuqeFoRI+1mMkSA3+"
+                        "S4mIdXg24+CndPtMOJ+UKqaWVJ/MbdTcuHYoMF439yj4A6Cae9sAYY+XEUlrfUnnLAPn0epDGwHuDSXltp2emnmvPa3H11Vc"
+                        "lmGh8nq/sHzCgsEawCgiHDBfzT1CMdDs8nI5ksat1+HkfeyMQvhTfiArVpHb2gnMDDdxK6Pf0SQyeWEyaxE356QkTzp0vJli"
+                        "B2OHx5bMTPUmo2HYgW2PS7LF0pHB2i5XmgW+eHTf9HNquLNLsLmeni1Nekr0+PPYdMHpUMCX+awKljsW6cjMFk2hCXGf/kFZ"
+                        "QhqexMOJ35aLlUMug3ANF9bEgMdYnRcNQxSjNYIwMk0VC6U72vITN1DbUAfJIt+NszKFjrnUblJRYhzz8AArmuQShBSbiPhO"
+                        "++Gffw6zuHMM/yPW5ODzxCxECVoDtycr6u/ToJbbrcyKOabyOg5CbigKgXKes7fa81aFWOby2u5EYRjuSLjyDITB8odqJ9T0"
+                        "2LWBU3c8jA1ODcHjoYHVfrbFBFBn0mr7ec/zWM4dGJy7xothYUvx0Eyvp/tEQ6QGKpVoDMRCcOSSL9LhGgIPLg0SHhhHsKcw"
+                        "dyF9LG0AjyKTgqc3KXbFAowJA1f1HNLEQieUOoo8o+Fu5S7GaQKnTEjJp8ytwHFs2fIDbpo4fgAj0MfJfSWbn1kuYTU7LnEK"
+                        "DM1/Q4pjJdluCkJkw9EEocA5Y/jHl7+CsNjVlwsACmfPT3ELaRVDhCAZnsgPiJGi8MZzHfP7Y9+mxLdJVc+awLSq6K65Shz3"
+                        "DdKB1szzOHhei1FyrIVIxMnYHcRs60rXGaur8NZPZxLccWbdyoqXn0VWpG0diXXrGNMbdENlxxUjl6yltM8Pgk1i0cxgqCI4"
+                        "cy+98Ute0eNBxAMd5oYAN8XirepNxElhCwMuAqMZU0XZoD2jdMk7ajdhOG8UYUmdzxvGhk5qAXS02dk4mVkFFZkBNHqIe+vU"
+                        "XAgmRGiAmOiKCDvlUi/+42uJN6FHKjenB7TjPZuZzooNdJzN1YouBpPpn1hK1FV1XDMev4I2yR2QxWLJ/CCJf1SOF+EiNr7L"
+                        "WEV2OKUv9ZRe/orsfWCunDgrj7eQylDTHK6pDP36vZUckUz+po16JZCU3CiLh1ANo+haA40pySTsJYF/Sq0Luew4nV4mAoSG"
+                        "DZ1qaqI/XG4m7ARr+4GwB51Hp1x+yMyvrGh69IgQss5OY5NiyIl76EOkIepOm80lLne8q6kYbIz1XUODNSVFYDvU+8D+sXII"
+                        "FUovH7OsBR2qKBXUTId44CWryz0IXFvk8+MP32ZvPEXgLb+nRJWfROWpxqUHeWo6lLb0cmtRsoVocmZ2Ch3lPiW74Udr64rs"
+                        "oRgBHs5Hki0hOZ8yUCe8bZsQQreJh4+HI2HuLx0ynh+0M2G0qFwJDlPQlC6+PP/HrGWkVeoSz5Jxa0FhCbmHyUR64KM1t0LP"
+                        "AtWL34FnKnpWwC2ZjnejBiPSGYosqY2VM6uPkp4aP4tSPpy3KbZkuOyKA3vxYXAgtjm2u9BL1rnG7YFR4tGqYY+Z2BT4Qz9w"
+                        "Km3ZFZUJRf1ynbxNyXye9Keu3UdHFVNuuqZgIC00wIfqcH9opZngFoA7Qj+8BhLvbokPD79XR/w3ycFTgn+61CGps4PVGfbM"
+                        "uJgcTOUEJfEuZYqTvOC0ld50kjz7DPkAfZjMJ4kanFjoxVl+v59gV+USuolbsCXml/zmxjbmWtmg9mbqBjJArieudKJJikBo"
+                        "rLMOEPKE0lmB1KZfjescgINKzPiEMkmLjtB28esTGePkCtiQnJRYxPj9WBAQLEc41atT+M+LX0Oty1Wq1uVqqZ4xCODYNUIF"
+                        "mrQUpa1HsoFMaD81nKbRtrczMR+GuR+N6XEhndRn0Mr6m1TTKR/6txsWINkfgYYMoc0mpY5kY12OKBk8aG9euldMgFD0DWjk"
+                        "UnwMczQSbRCYC8KXMu2u80ZZH9405PL2Tl3sNyNuT1otGIQo1YrbL/fiRhLo+eMZk8LZZvSzCw4YSkCaoQX0+BORSbJZIpZm"
+                        "tcHeIdXJaD48KfWL5I1yfXREfUImuGP6IKroiNs8i03YCOH2KI3G1/W7QMWeOQgNZtL0UgF1dZ6VxUGhSfxERsVoa2TrOsNZ"
+                        "2NT3JhM8y1gkS068yExVABjEPwX8+wzZyt85rcu1d9JCRIQp9zSfEXyCoZKCVFtATiEfU4BqADDMp2DhcOLWzmuNzd24YTYL"
+                        "z1+uiQOmbfHRMN1oEqt3SFRyhIY4+OaupRFOnj2tfVjrpDCNUyAc3P40sFRseiROln2VhK2SS7GXDBIkwldbxz2x2nKVGN2q"
+                        "u40uehxuvhI2ufoVFNzj8pPB5svTp2dHyjDL3XT+1VfffU9YPYsAGfQ9hvOgAXIULOvaJv6wIG0pKsGW6m7JXQm94Rbe1wyc"
+                        "NYAoYlMSXsUUZeKbP7+eVZzCkelAmnfDZ4TyQIdnnq81aB6aMkpkih64jz+1nIJUs1DHAglxmlHTKYnYQFFyrNfD3tIJ5nZE"
+                        "MdYlL0etYbGzlV3qyghaBisI/H21jlCILuhblw0TkG0VzYLElLGu2TSlTSdqYePldYsN89VGf0CKU2yKptqONOgvkV9IbOhZ"
+                        "nhh3+1g9jjjVNn/kgCVxB54ExxxgBw9sTWeIM2sDeLCzebM6DxnJ+naruCGVB2AkwH9XB1RmUCckKtqz+4BW44XJU56HxWUr"
+                        "WFP+Mli2mSvJrPsVPkzApGYkoJvmoR+iYadUCS7Yy4y50G+JaTHMAY7VuD3tq39HhYjqd4fzxkLHtqSXBYGvi9tVfpSOHZ7j"
+                        "aFX8tGMsjeYTjyW1RiU3Ik2AlRbo4me/Mx0M1gTDedqgwlHIPks1Eb2dsYiOgAN608iEi7SMKR1oWar4TvLefN+vE77cxWcU"
+                        "CfjaxxUJtOK0kr8eiw4NRNcr4ox6DffDpCtYg4YWWIwoEDeZJ5vWHfjfrK0Gpz/02JmGoORDFO0y59l2Fq4ZD9eDHFEDknlf"
+                        "ACqJh2wQoL13ARo7HlVH1Ps9TspSaEJFst352bO7/b+/3dc3oPyBlzje97lvIY7XYp4Y02lj/hPSwYqkLrti34QiIT5+nGOk"
+                        "kUydZapVYRf/xO7RP/kqjaXwT5yw/L05Ip1jg0wQQSYZpIkuDOUNI+rJ210PYUA9wwxH+Z2Lu/E173kkX41RXC6MnRNTb2n+"
+                        "VHQoQL9T4SwsZLFnw6ZbzHrEa9PrQCWhaz8JEvVuxKDhqQQFFXpU/NrHeDqYTf6a7lbB4TOBS6m4kClioOMasAnD62hAwRRa"
+                        "A98Vpr5qz9R3k0kpiw9lFUu2oyQVpOeeg8fYNnA+Yb449zHzapMZrOkcHlpsCuK7x2sOJtWz59JL+fwxuOuzJJpknTneAl3s"
+                        "goN3A0RxyAibSCyEq1lPwYneLFTeMI/II3iytBSxMT8dgkhPomWEevKfubBCI28rR7eKarmPFTygMGhahrVx3glbUzdZQfvg"
+                        "bTGahpQZrRxNj5Vl1QUVTW6rhrE37F+1TYHUSujjpPiMdo5OBNAVzsd7HBlEFT6o5HTQZJ9EwBaYPI6gIKbXm7o+BhkxuSGU"
+                        "DzBEiqZ+YKiWqMk2sdCDI3TRqRr0IK4M0to+CxsEAj848Ri1jvEuuffc2gE+YnMnTJJpyPTT/8ziFDkkjQI+x8cxUBgXd4MP"
+                        "/+1Rqk4btLDhLVSp3avrHQ7GbKeTAhzt2KEx6VRSGnK1OFxZQEukskynBSvc6hy5XOQiOYEJDmKFhAeKfDg4EfCC67wTEHkL"
+                        "L/LjUQiPgClWH+7G88iPo4VMqrEm11KOc442cfUPK9E9UMbF0tJBvP/b/wWLHgNH"
+                    )
+                    QA_ENTRIES = json.loads(zlib.decompress(base64.b64decode("".join(_BLOB.split()))).decode("utf-8"))
+
+                    STOPWORDS = {
+                        "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "is", "are", "be",
+                        "can", "could", "may", "must", "shall", "should", "would", "do", "does", "did",
+                        "we", "it", "its", "this", "that", "these", "those", "what", "which", "who", "whom",
+                        "when", "where", "how", "why", "with", "without", "by", "from", "as", "at", "if",
+                        "not", "no", "any", "all", "such", "than", "there", "their", "they", "them", "has",
+                        "have", "had", "been", "being", "was", "were", "will", "under", "into", "about",
+                        "after", "before", "between", "also", "only", "one", "same", "other", "us", "our",
+                        "you", "your", "i", "my", "me", "please", "tell", "explain", "say", "says", "mean",
+                    }
+                    TOP_K = 3
+                    MAX_ANSWER_CHARS = 6000
+
+                    def _tokens(text):
+                        out = []
+                        for tok in re.findall(r"[a-z0-9]+", (text or "").lower()):
+                            if tok in STOPWORDS or len(tok) < 2:
+                                continue
+                            # crude stemming: plural / verbal endings
+                            for suffix in ("ations", "ation", "ings", "ing", "ies", "ly", "es", "s", "ed"):
+                                if tok.endswith(suffix) and len(tok) - len(suffix) >= 4:
+                                    tok = tok[: -len(suffix)]
+                                    break
+                            out.append(tok)
+                        return out
+
+                    # Pre-tokenize once at import.
+                    _INDEX = []
+                    for _e in QA_ENTRIES:
+                        q_toks = _tokens(_e["question"])
+                        a_toks = _tokens(_e["answer"] + " " + " ".join(_e.get("sources", [])))
+                        a_tf = {}
+                        for t in a_toks:
+                            a_tf[t] = a_tf.get(t, 0) + 1
+                        _INDEX.append({"q": set(q_toks), "q_list": q_toks, "a_tf": a_tf, "a_len": max(len(a_toks), 1)})
+
+                    # Document frequency over answers, so generic procurement vocabulary weighs less.
+                    _DF = {}
+                    for _ix in _INDEX:
+                        for t in _ix["a_tf"]:
+                            _DF[t] = _DF.get(t, 0) + 1
+                    _N = len(_INDEX)
+
+                    def _idf(tok):
+                        return math.log(1 + _N / (1 + _DF.get(tok, 0)))
+
+                    def _score(query_tokens, ix):
+                        if not query_tokens:
+                            return 0.0
+                        qset = set(query_tokens)
+                        # Title match dominates: the entries are keyed by their question.
+                        title_hits = sum(_idf(t) for t in qset if t in ix["q"])
+                        title_cov = len(qset & ix["q"]) / max(len(ix["q"]), 1)
+                        # Body match, tf-idf-ish and length-normalized.
+                        body = 0.0
+                        for t in qset:
+                            tf = ix["a_tf"].get(t, 0)
+                            if tf:
+                                body += (1 + math.log(tf)) * _idf(t)
+                        body /= math.sqrt(ix["a_len"] / 200.0)
+                        # Consecutive-bigram bonus on the title.
+                        bigram = 0
+                        ql = ix["q_list"]
+                        for i in range(len(query_tokens) - 1):
+                            pair = (query_tokens[i], query_tokens[i + 1])
+                            for j in range(len(ql) - 1):
+                                if (ql[j], ql[j + 1]) == pair:
+                                    bigram += 1
+                                    break
+                        return 3.0 * title_hits + 4.0 * title_cov + 1.2 * body + 1.5 * bigram
+
+                    @component
+                    class ReferenceQALookup:
+                        """Returns the exemplar Q&A entries closest to a query (lexical matching, in memory)."""
+                        @component.output_types(result=str)
+                        def run(self, query: str):
+                            query_tokens = _tokens(query)
+                            scored = sorted(
+                                ((_score(query_tokens, ix), i) for i, ix in enumerate(_INDEX)),
+                                key=lambda p: p[0],
+                                reverse=True,
+                            )
+                            best = scored[0][0] if scored else 0.0
+                            # Keep the top entries that are at least reasonably close to the best one.
+                            picked = [i for s, i in scored[:TOP_K] if s > 0 and s >= 0.35 * best]
+                            if not picked:
+                                return {"result": (
+                                    "No reference Q&A entry matches this question. Proceed with the corpus "
+                                    "search tools directly (search_in_file on the Financial Regulation for "
+                                    "general questions, search_corpus otherwise)."
+                                )}
+                            blocks = []
+                            for rank, i in enumerate(picked, start=1):
+                                e = QA_ENTRIES[i]
+                                answer = e["answer"]
+                                if len(answer) > MAX_ANSWER_CHARS:
+                                    answer = answer[:MAX_ANSWER_CHARS] + "\n[... entry truncated ...]"
+                                sources = "\n".join(f"- {s}" for s in e.get("sources", [])) or "- (none listed)"
+                                blocks.append(
+                                    f"### Reference entry {rank}: {e['question']}\n{answer}\nSources:\n{sources}"
+                                )
+                            header = (
+                                f"{len(picked)} reference Q&A entr{'y' if len(picked) == 1 else 'ies'} matching the "
+                                "question (best first). These are curated exemplar answers, NOT corpus passages: "
+                                "use them to identify the applicable instruments and provisions, the search terms, "
+                                "and the expected structure of the answer. Then retrieve and cite the actual "
+                                "passages with search_in_file / search_corpus. Never quote or cite these entries.\n"
+                            )
+                            return {"result": header + "\n\n".join(blocks)}
+      # =========================================================================
+      # TOOL 1: list_corpus_files - resolve a document name/alias to file_id(s)
+      #
+      # Deliberately a PipelineTool (single Code component), NOT deepset's native
+      # CodeTool (deepset_cloud_custom_nodes.tools.code_tool.CodeTool, @tool
+      # function): the listing MUST be restricted by the entitlement filters, which
+      # only reach a tool via inputs_from_state, and the CodeTool path has no
+      # documented state access. Project isolation depends on this: without the
+      # filters, the tool would reveal file names the user is not entitled to see.
+      # =========================================================================
+      - type: haystack.tools.pipeline_tool.PipelineTool
+        data:
+          name: list_corpus_files
+          description: >-
+            List the documents available in the corpus, optionally filtered by a
+            case-insensitive name pattern (substring or simple regex, e.g.
+            "financial regulation"). Use this FIRST whenever the user refers to
+            a specific document by name, alias or abbreviation, to resolve it to
+            an exact file_name and file_id before calling search_in_file.
+            Returns one line per file, sorted by authority then name, with
+            file_name, file_id, authority_rank (1 = legal acts, 2 = internal
+            rules and circulars, 3 = guidance and vademecum, 4 = tender and
+            contract documents, 5 = Q&A logs and correspondence) and chunk
+            count. Use authority_rank to pick which file to search and cite
+            first. Optionally restrict the listing to one authority level.
+            Returns nothing if no accessible file matches.
+          # DRAFT 6: explicit schema - see the note on search_corpus.parameters.
+          # DRAFT 9b: optional authority_rank filter. Optional = NOT in `required`;
+          # additionalProperties stays false. The lister treats a missing/null value
+          # as "no filter".
+          parameters:
+            type: object
+            additionalProperties: false
+            properties:
+              name_pattern:
+                type: string
+                description: >-
+                  Case-insensitive substring or simple regex matched against
+                  document file names, e.g. "financial regulation". Pass an
+                  empty string to list every accessible document.
+              authority_rank:
+                type: integer
+                description: >-
+                  Optional. Only list files of this authority level (1 legal
+                  acts, 2 internal rules and circulars, 3 guidance and
+                  vademecum, 4 tender and contract documents, 5 Q&A logs and
+                  correspondence). Omit to list all levels.
+            required:
+            - name_pattern
+          input_mapping:
+            # LLM-provided:
+            name_pattern:
+            - lister.name_pattern
+            authority_rank:
+            - lister.authority_rank
+            # State-provided (see inputs_from_state). NOTE: the filters go to the
+            # RETRIEVER, not to the Code component - the Code component never talks to
+            # OpenSearch itself (see the "document stores live in YAML" note below).
+            filters:
+            - corpus_scan.filters
+          output_mapping:
+            lister.result: result
+          inputs_from_state:
+            # {state_key: tool parameter name} - values are STRINGS (draft-2 fix).
+            filters: filters
+          outputs_to_string:
+            source: result
+          pipeline:
+            components:
+              corpus_scan:
+                # ======================= DRAFT 3 FIX =======================
+                # The previous version built an OpenSearchDocumentStore inside the Code
+                # component. That fails at runtime with
+                #   ConnectionError(HTTPConnection(host='localhost', port=9200) ...)
+                # because deepset injects the real cluster host and credentials when a
+                # document store is deserialized FROM THE YAML (its from_dict hook). A
+                # store constructed in Python never goes through that hook, so it keeps
+                # the library defaults (localhost:9200) and there is no such cluster in
+                # the container.
+                #
+                # RULE: every document store must be DECLARED IN YAML as an
+                # init_parameter of a real component. Never instantiate one in a Code
+                # component. Any store the pipeline needs must therefore be reachable
+                # through a component that accepts `document_store` - here FilterRetriever,
+                # which is exactly `filter_documents(filters)` wrapped as a component.
+                # ===========================================================
+                #
+                # Entitlement: filters arrive from agent state and are applied here, by
+                # the same code path as the other retrievers - no custom DSL, no
+                # $filters-rendering subtlety (cf. the v0.8 custom_query warning). As
+                # everywhere else in ALINA, absent filters means "the whole corpus", which
+                # is the existing semantics, not a new one.
+                #
+                # COST: this pulls every entitled chunk on each call. Acceptable at pilot
+                # scale (~100s of files) and the listing is exhaustive and deterministic.
+                # Two escalation paths when the corpus grows:
+                #   1. add `return_embedding: false` to the store below if the installed
+                #      opensearch integration supports it - it strips the 768-dim vectors
+                #      from the response, which is the bulk of the payload. VERIFY the
+                #      parameter exists before adding it: an unknown init parameter fails
+                #      the whole pipeline.
+                #   2. replace this component with an OpenSearchBM25Retriever whose query
+                #      is the name_pattern (default_field "*" makes meta.file_name
+                #      searchable, cf. v0.8) and top_k ~200: cheap and good enough to
+                #      resolve a name, but no longer an exhaustive listing.
+                # If FilterRetriever is not available in this deployment's component list,
+                # path 2 is the fallback.
+                type: haystack.components.retrievers.filter_retriever.FilterRetriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                      # return_embedding: false   # see COST note 1 above - verify first
+              lister:
+                # Pure in-memory reduction: chunks -> distinct files. Touches no service.
+                # DRAFT 9b: the listing is sorted by authority_rank (unknown last), each
+                # line carries the rank AND its label, the header carries the legend, and
+                # an optional authority_rank filter restricts the listing to one level.
+                # PRECONDITION: authority_rank must exist on the chunks. Today it is not
+                # populated by the indexing pipeline (see the note at the top of
+                # alina-indexing-v0.4.yaml): attach it as file-level metadata at upload
+                # (deepset propagates file meta onto documents). Until then every file
+                # shows "authority_rank": null / "unknown" and the filter matches nothing
+                # - which the tool reports explicitly instead of returning an empty list.
+                type: deepset_cloud_custom_nodes.code.code_component.Code
+                init_parameters:
+                  code: |
+                    import json
+                    import re
+                    from haystack import component
+                    from haystack.dataclasses import Document
+                    MAX_FILES = 300
+                    AUTHORITY_LABELS = {
+                        1: "legal acts (Financial Regulation and annexes, EU directives)",
+                        2: "internal rules, Commission decisions, circulars",
+                        3: "guidance documents, vademecum",
+                        4: "tender specifications, contract documents",
+                        5: "Q&A logs, checklists, correspondence",
+                    }
+                    LEGEND = "authority_rank: " + ", ".join(f"{k} = {v}" for k, v in AUTHORITY_LABELS.items())
+
+                    def _rank(value):
+                        """Normalizes the meta value (int, numeric string or None) to int or None."""
+                        try:
+                            rank = int(str(value).strip())
+                        except (TypeError, ValueError):
+                            return None
+                        return rank if rank in AUTHORITY_LABELS else None
+
+                    @component
+                    class CorpusFileLister:
+                        """Reduces entitled chunks to a distinct-file listing, ordered by authority.
+                        Receives documents from an upstream retriever (which owns the
+                        document store), so this component never opens a connection
+                        itself. Name matching is done here, on meta.file_name: a regex
+                        when the pattern compiles, a case-insensitive substring otherwise.
+                        """
+                        @component.output_types(result=str)
+                        def run(self, documents: list[Document], name_pattern: str = "", authority_rank: int | None = None):
+                            name_pattern = (name_pattern or "").strip()
+                            wanted_rank = _rank(authority_rank)
+                            pattern = None
+                            if name_pattern:
+                                try:
+                                    pattern = re.compile(name_pattern, re.IGNORECASE)
+                                except re.error:
+                                    pattern = None
+                            needle = name_pattern.lower()
+                            files = {}
+                            ranks_seen = 0
+                            for doc in documents:
+                                name = doc.meta.get("file_name") or "unknown"
+                                if pattern is not None:
+                                    if not pattern.search(name):
+                                        continue
+                                elif needle and needle not in name.lower():
+                                    continue
+                                rank = _rank(doc.meta.get("authority_rank"))
+                                if rank is not None:
+                                    ranks_seen += 1
+                                if wanted_rank is not None and rank != wanted_rank:
+                                    continue
+                                entry = files.setdefault(name, {
+                                    "file_name": name,
+                                    "file_id": doc.meta.get("file_id"),
+                                    "authority_rank": rank,
+                                    "authority": AUTHORITY_LABELS.get(rank, "unknown"),
+                                    "chunks": 0,
+                                })
+                                entry["chunks"] += 1
+                            listing = sorted(files.values(), key=lambda e: (e["authority_rank"] is None, e["authority_rank"] or 0, e["file_name"]))
+                            truncated = len(listing) > MAX_FILES
+                            listing = listing[:MAX_FILES]
+                            if not listing:
+                                if wanted_rank is not None and ranks_seen == 0:
+                                    return {"result": (
+                                        f"No file carries an authority_rank in this corpus, so the filter "
+                                        f"authority_rank={wanted_rank} cannot match. Call again without it "
+                                        "and pick the file by name."
+                                    )}
+                                if wanted_rank is not None:
+                                    return {"result": (
+                                        f"No accessible document has authority_rank={wanted_rank}"
+                                        + (f' and matches "{name_pattern}"' if name_pattern else "")
+                                        + ". Call again without the authority_rank filter."
+                                    )}
+                                if name_pattern:
+                                    return {"result": (
+                                        f'No accessible document matches "{name_pattern}". '
+                                        "Try a shorter or different pattern, or call this tool "
+                                        "with an empty pattern to see what is available."
+                                    )}
+                                return {"result": "No documents are accessible in this conversation."}
+                            header = f"{len(listing)} accessible document(s), highest authority first"
+                            if wanted_rank is not None:
+                                header += f" (authority_rank={wanted_rank} only)"
+                            if truncated:
+                                header += " (listing truncated - narrow the pattern)"
+                            header += f"\n{LEGEND}"
+                            body = "\n".join(json.dumps(e) for e in listing)
+                            return {"result": f"{header}:\n{body}"}
+            connections:
+            - sender: corpus_scan.documents
+              receiver: lister.documents
+      # =========================================================================
+      # TOOL 2: search_corpus - the entire v0.x retrieval chain, corpus-wide
+      # =========================================================================
+      - type: haystack.tools.pipeline_tool.PipelineTool
+        data:
+          name: search_corpus
+          description: >-
+            Search the whole document corpus with a short, self-contained query.
+            Use for any question that does not target one specific document, or
+            to check whether a higher-authority source also covers a rule found
+            elsewhere. Returns the most relevant passages, tagged with global
+            reference numbers for citation.
+          # ======================= DRAFT 6 FIX =======================
+          # THE tool schema is now declared explicitly instead of being derived from
+          # input_mapping. This is the fix for the empty-ChatMessage failure.
+          #
+          # Chain of evidence: the trace shows chat_generator(885ms, ok) ->
+          # tool_invoker(6ms, ok) -> chat_generator(5ms, FAIL), with Total tokens 0.
+          # No tool here can run in 6ms, and a ToolInvoker that returns that fast has
+          # nothing to invoke: the assistant message carried NO tool call. In Haystack's
+          # streaming path, a tool call whose accumulated arguments are empty or invalid
+          # JSON is dropped with only a log warning, and the assembler then returns
+          #   ChatMessage.from_assistant(text=None, tool_calls=[], ...)
+          # i.e. a genuinely empty message. exit_conditions: [text] does not match it
+          # either (no text), so the loop runs again and dies serializing it.
+          #
+          # Why the arguments were malformed: without an explicit `parameters`,
+          # PipelineTool derives the LLM-facing schema from input_mapping - which here
+          # also lists `filters` and `state_documents`. The model was being asked to
+          # produce a `state_documents` argument typed list[Document]. That also answers
+          # open question [U1']: inputs_from_state does NOT hide a parameter from the
+          # schema, so state-fed inputs must be kept out of `parameters` by hand - which
+          # is a SECURITY requirement for `filters`, not only a correctness one.
+          # Consistent with list_corpus_files having worked: its only derived argument
+          # was a plain string.
+          #
+          # IF THIS IS NOT ENOUGH: the remaining suspect is the streaming assembly
+          # itself (the EC proxy may not emit argument deltas the way the assembler
+          # expects). Test by removing `streaming_callback` from the agent for one run;
+          # if that fixes it, keep the agent unstreamed and stream from a trailing
+          # component instead - the app already handles a non-streamed result event
+          # (finalizeBlock in search-stream/route.ts).
+          # ===========================================================
+          parameters:
+            type: object
+            additionalProperties: false
+            properties:
+              query:
+                type: string
+                description: >-
+                  A short, self-contained search query: keywords and the terms
+                  the documents themselves would use. Never paste conversation
+                  history.
+            required:
+            - query
+          input_mapping:
+            # LLM-provided argument -> internal pipeline sockets (lists are fine HERE):
+            query:
+            - retrieval_query.query
+            - ranker.query
+            - ranker_scoring.query
+            # State-provided (see inputs_from_state):
+            filters:
+            - bm25_retriever.filters
+            - embedding_retriever.filters
+            state_documents:
+            - result_formatter.state_documents
+          output_mapping:
+            # {pipeline output socket: tool output name}
+            result_formatter.documents: documents
+            result_formatter.result: result
+          inputs_from_state:
+            # {state_key: tool parameter name} - STRING values (draft-2 fix).
+            # [U1'] verify these are hidden from the LLM schema and win over LLM args.
+            filters: filters
+            documents: state_documents
+          outputs_to_state:
+            # New unique documents append to state.documents [U4].
+            documents:
+              source: documents
+          outputs_to_string:
+            # What the LLM receives as tool result: the rendered block only, never the
+            # serialized Document list.
+            source: result
+          pipeline:
+            components:
+              retrieval_query:
+                # v0.8 guard kept. The agent writes short queries, so this should never
+                # trigger, but it is free insurance against maxClauseCount regressions.
+                type: haystack.components.converters.output_adapter.OutputAdapter
+                init_parameters:
+                  template: '{{ query.split()[-100:] | join('' '') }}'
+                  output_type: str
+              bm25_retriever:
+                type: haystack_integrations.components.retrievers.opensearch.bm25_retriever.OpenSearchBM25Retriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                  top_k: 30
+                  fuzziness: 0
+              query_embedder:
+                type: deepset_cloud_custom_nodes.embedders.nvidia.text_embedder.DeepsetNvidiaTextEmbedder
+                init_parameters:
+                  normalize_embeddings: true
+                  model: intfloat/e5-base-v2
+                  prefix: 'query: '
+                  suffix: ''
+              embedding_retriever:
+                type: haystack_integrations.components.retrievers.opensearch.embedding_retriever.OpenSearchEmbeddingRetriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                  top_k: 30
+              document_joiner:
+                type: haystack.components.joiners.document_joiner.DocumentJoiner
+                init_parameters:
+                  join_mode: reciprocal_rank_fusion
+              ranker:
+                # v0.7 memory settings kept (batch 8; agent multiplies reranker rounds,
+                # so do NOT raise these without re-checking the OOM signature).
+                type: deepset_cloud_custom_nodes.rankers.nvidia.ranker.DeepsetNvidiaRanker
+                init_parameters:
+                  model: tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+                  top_k: 10
+                  batch_size: 8
+                  meta_fields_to_embed:
+                  - header
+                  - file_name
+                  embedding_separator: \n
+              sentence_window_retriever:
+                type: haystack.components.retrievers.sentence_window_retriever.SentenceWindowRetriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                  window_size: 1
+                  source_id_meta_field: file_id
+                  split_id_meta_field: split_id
+                  raise_on_missing_meta_fields: false
+              window_joiner:
+                type: haystack.components.joiners.document_joiner.DocumentJoiner
+                init_parameters:
+                  join_mode: concatenate
+              ranker_scoring:
+                # v0.6 fix kept: scores without trimming (top_k >= 10 * (2*1+1)).
+                type: deepset_cloud_custom_nodes.rankers.nvidia.ranker.DeepsetNvidiaRanker
+                init_parameters:
+                  model: tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+                  top_k: 30
+                  batch_size: 8
+                  meta_fields_to_embed:
+                  - header
+                  - file_name
+                  embedding_separator: \n
+                  scale_score: true
+                  calibration_factor: 1
+              meta_field_grouping_ranker:
+                # Groups by authority INSIDE the tool, before state append - never after
+                # the agent, where reordering would break citation numbering.
+                type: haystack.components.rankers.meta_field_grouping_ranker.MetaFieldGroupingRanker
+                init_parameters:
+                  group_by: authority_rank
+                  subgroup_by: file_id
+                  sort_docs_by: split_id
+              result_formatter:
+                # DRAFT 9c: stable citation tokens instead of positional numbers.
+                # Dedup against state + v0.6 context budget unchanged.
+                type: deepset_cloud_custom_nodes.code.code_component.Code
+                init_parameters:
+                  code: |
+                    import hashlib
+                    from haystack import component
+                    from haystack.dataclasses import Document
+                    PER_DOC_CHARS = 12000
+                    MAX_DOCS_PER_CALL = 30
+                    TOKEN_LEN = 6
+                    def citation_token(document_id):
+                        """Stable per-document citation token. MUST stay identical in
+                        attachment_formatter, both result_formatters and citation_renumberer."""
+                        return hashlib.sha1(str(document_id).encode("utf-8")).hexdigest()[:TOKEN_LEN]
+                    @component
+                    class ResultFormatter:
+                        """Renders passages for the LLM with STABLE citation tokens.
+                        The reference is derived from the document id, not from a position,
+                        so it does not depend on how many documents are already in state.
+                        Parallel tool calls all read the same (possibly empty) state, which
+                        is why positional numbering collided - see the DRAFT 9c header note.
+                        citation_renumberer turns the tokens the model actually used into
+                        [1], [2], [3] and rebuilds the documents list in that order.
+                        state_documents is still used so a passage already in state is
+                        re-rendered but not appended twice.
+                        """
+                        @component.output_types(documents=list[Document], result=str)
+                        def run(self, documents: list[Document], state_documents: list[Document] | None = None):
+                            known = {d.id for d in (state_documents or [])}
+                            new_docs, blocks = [], []
+                            for doc in documents[:MAX_DOCS_PER_CALL]:
+                                if doc.id not in known:
+                                    known.add(doc.id)
+                                    new_docs.append(doc)
+                                full = doc.content or ""
+                                body = full[:PER_DOC_CHARS]
+                                truncated = ' truncated="true"' if len(full) > len(body) else ""
+                                tail = "\n[... this passage continues beyond what is shown here ...]" if truncated else ""
+                                blocks.append(
+                                    f'<document reference="{citation_token(doc.id)}" source="{doc.meta.get("file_name")}" '
+                                    f'section="{doc.meta.get("header")}" page="{doc.meta.get("page_number")}"{truncated}>\n'
+                                    f"{body}{tail}\n</document>"
+                                )
+                            if not blocks:
+                                result = ("No documents found for this query. Reformulate, or tell the "
+                                          "user you have no source material for this point.")
+                            else:
+                                result = ("Passages grouped by authority rank (earlier = higher legal "
+                                          "authority). Cite each claim with the passage's reference "
+                                          "token in square brackets, copied exactly, e.g. [a1b2c3].\n"
+                                          "<documents>\n" + "\n".join(blocks) + "\n</documents>")
+                            return {"documents": new_docs, "result": result}
+            connections:
+            - sender: retrieval_query.output
+              receiver: bm25_retriever.query
+            - sender: retrieval_query.output
+              receiver: query_embedder.text
+            - sender: bm25_retriever.documents
+              receiver: document_joiner.documents
+            - sender: query_embedder.embedding
+              receiver: embedding_retriever.query_embedding
+            - sender: embedding_retriever.documents
+              receiver: document_joiner.documents
+            - sender: document_joiner.documents
+              receiver: ranker.documents
+            - sender: ranker.documents
+              receiver: sentence_window_retriever.retrieved_documents
+            - sender: sentence_window_retriever.context_documents
+              receiver: window_joiner.documents
+            - sender: window_joiner.documents
+              receiver: ranker_scoring.documents
+            - sender: ranker_scoring.documents
+              receiver: meta_field_grouping_ranker.documents
+            - sender: meta_field_grouping_ranker.documents
+              receiver: result_formatter.documents
+      # =========================================================================
+      # TOOL 3: search_in_file - identical chain + file_id constraint
+      # Only the differences from search_corpus are commented.
+      # =========================================================================
+      - type: haystack.tools.pipeline_tool.PipelineTool
+        data:
+          name: search_in_file
+          description: >-
+            Search INSIDE one or more specific documents, identified by file_ids
+            obtained from list_corpus_files, or by a known reference file_id such
+            as the Financial Regulation's. Use whenever the user asks what a
+            specific document says, defines or requires, and for every general
+            question (definition, general rule, principle) on the Financial
+            Regulation. If this returns nothing relevant, tell the user the named
+            document does not contain it - do not silently substitute another
+            source. Returns passages tagged with global reference numbers for
+            citation.
+          # DRAFT 6: explicit schema - see the note on search_corpus.parameters.
+          parameters:
+            type: object
+            additionalProperties: false
+            properties:
+              query:
+                type: string
+                description: >-
+                  A short, self-contained search query using the terms the
+                  document itself would use. Never paste conversation history.
+              file_ids:
+                type: array
+                items:
+                  type: string
+                description: >-
+                  file_id values returned by list_corpus_files, or a known
+                  reference file_id. Only documents with these ids are searched.
+            required:
+            - query
+            - file_ids
+          input_mapping:
+            query:
+            - retrieval_query.query
+            - ranker.query
+            - ranker_scoring.query
+            # LLM-provided list of file_ids, ANDed with entitlement filters below.
+            file_ids:
+            - file_filter_merger.file_ids
+            # State-provided:
+            filters:
+            - file_filter_merger.base_filters
+            state_documents:
+            - result_formatter.state_documents
+          output_mapping:
+            result_formatter.documents: documents
+            result_formatter.result: result
+          inputs_from_state:
+            filters: filters
+            documents: state_documents
+          outputs_to_state:
+            documents:
+              source: documents
+          outputs_to_string:
+            source: result
+          pipeline:
+            components:
+              file_filter_merger:
+                # SECURITY-SENSITIVE (v0.8 warning applies): must AND, never replace,
+                # the entitlement filters. Unit-test the empty/None base_filters path.
+                # [O5] Use the exact field spelling the app sends today ("file_id" vs
+                # "meta.file_id") - check src/app/api/haystack/search-stream/route.ts.
+                type: deepset_cloud_custom_nodes.code.code_component.Code
+                init_parameters:
+                  code: |
+                    from typing import Any
+                    from haystack import component
+                    @component
+                    class FileFilterMerger:
+                        """ANDs the entitlement filters with a file_id constraint."""
+                        # dict[str, Any], not bare dict: the retrievers' filters input is
+                        # declared dict[str, Any] | None and haystack's connection type
+                        # check rejects an unparameterized dict as the sender.
+                        @component.output_types(filters=dict[str, Any])
+                        def run(self, file_ids: list[str], base_filters: dict[str, Any] | None = None):
+                            file_condition = {
+                                "field": "file_id",
+                                "operator": "in",
+                                "value": [str(f) for f in file_ids if f],
+                            }
+                            if not base_filters:
+                                return {"filters": {"operator": "AND", "conditions": [file_condition]}}
+                            return {"filters": {"operator": "AND", "conditions": [base_filters, file_condition]}}
+              retrieval_query:
+                type: haystack.components.converters.output_adapter.OutputAdapter
+                init_parameters:
+                  template: '{{ query.split()[-100:] | join('' '') }}'
+                  output_type: str
+              bm25_retriever:
+                type: haystack_integrations.components.retrievers.opensearch.bm25_retriever.OpenSearchBM25Retriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                  top_k: 30
+                  fuzziness: 0
+              query_embedder:
+                type: deepset_cloud_custom_nodes.embedders.nvidia.text_embedder.DeepsetNvidiaTextEmbedder
+                init_parameters:
+                  normalize_embeddings: true
+                  model: intfloat/e5-base-v2
+                  prefix: 'query: '
+                  suffix: ''
+              embedding_retriever:
+                type: haystack_integrations.components.retrievers.opensearch.embedding_retriever.OpenSearchEmbeddingRetriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                  top_k: 30
+              document_joiner:
+                type: haystack.components.joiners.document_joiner.DocumentJoiner
+                init_parameters:
+                  join_mode: reciprocal_rank_fusion
+              ranker:
+                type: deepset_cloud_custom_nodes.rankers.nvidia.ranker.DeepsetNvidiaRanker
+                init_parameters:
+                  model: tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+                  top_k: 10
+                  batch_size: 8
+                  meta_fields_to_embed:
+                  - header
+                  - file_name
+                  embedding_separator: \n
+              sentence_window_retriever:
+                type: haystack.components.retrievers.sentence_window_retriever.SentenceWindowRetriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                  window_size: 1
+                  source_id_meta_field: file_id
+                  split_id_meta_field: split_id
+                  raise_on_missing_meta_fields: false
+              window_joiner:
+                type: haystack.components.joiners.document_joiner.DocumentJoiner
+                init_parameters:
+                  join_mode: concatenate
+              ranker_scoring:
+                type: deepset_cloud_custom_nodes.rankers.nvidia.ranker.DeepsetNvidiaRanker
+                init_parameters:
+                  model: tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+                  top_k: 30
+                  batch_size: 8
+                  meta_fields_to_embed:
+                  - header
+                  - file_name
+                  embedding_separator: \n
+                  scale_score: true
+                  calibration_factor: 1
+              meta_field_grouping_ranker:
+                type: haystack.components.rankers.meta_field_grouping_ranker.MetaFieldGroupingRanker
+                init_parameters:
+                  group_by: authority_rank
+                  subgroup_by: file_id
+                  sort_docs_by: split_id
+              result_formatter:
+                # Same code as in search_corpus - keep the two copies in sync.
+                # DRAFT 9c: stable citation tokens instead of positional numbers.
+                type: deepset_cloud_custom_nodes.code.code_component.Code
+                init_parameters:
+                  code: |
+                    import hashlib
+                    from haystack import component
+                    from haystack.dataclasses import Document
+                    PER_DOC_CHARS = 12000
+                    MAX_DOCS_PER_CALL = 30
+                    TOKEN_LEN = 6
+                    def citation_token(document_id):
+                        """Stable per-document citation token. MUST stay identical in
+                        attachment_formatter, both result_formatters and citation_renumberer."""
+                        return hashlib.sha1(str(document_id).encode("utf-8")).hexdigest()[:TOKEN_LEN]
+                    @component
+                    class ResultFormatter:
+                        """Renders passages for the LLM with STABLE citation tokens."""
+                        @component.output_types(documents=list[Document], result=str)
+                        def run(self, documents: list[Document], state_documents: list[Document] | None = None):
+                            known = {d.id for d in (state_documents or [])}
+                            new_docs, blocks = [], []
+                            for doc in documents[:MAX_DOCS_PER_CALL]:
+                                if doc.id not in known:
+                                    known.add(doc.id)
+                                    new_docs.append(doc)
+                                full = doc.content or ""
+                                body = full[:PER_DOC_CHARS]
+                                truncated = ' truncated="true"' if len(full) > len(body) else ""
+                                tail = "\n[... this passage continues beyond what is shown here ...]" if truncated else ""
+                                blocks.append(
+                                    f'<document reference="{citation_token(doc.id)}" source="{doc.meta.get("file_name")}" '
+                                    f'section="{doc.meta.get("header")}" page="{doc.meta.get("page_number")}"{truncated}>\n'
+                                    f"{body}{tail}\n</document>"
+                                )
+                            if not blocks:
+                                result = ("This document does not contain passages matching the query. "
+                                          "Reformulate with the document's own vocabulary, or tell the "
+                                          "user the named document does not contain this information.")
+                            else:
+                                result = ("Passages from the requested document(s), grouped by authority "
+                                          "rank. Cite each claim with the passage's reference token in "
+                                          "square brackets, copied exactly, e.g. [a1b2c3].\n"
+                                          "<documents>\n" + "\n".join(blocks) + "\n</documents>")
+                            return {"documents": new_docs, "result": result}
+            connections:
+            - sender: file_filter_merger.filters
+              receiver: bm25_retriever.filters
+            - sender: file_filter_merger.filters
+              receiver: embedding_retriever.filters
+            - sender: retrieval_query.output
+              receiver: bm25_retriever.query
+            - sender: retrieval_query.output
+              receiver: query_embedder.text
+            - sender: bm25_retriever.documents
+              receiver: document_joiner.documents
+            - sender: query_embedder.embedding
+              receiver: embedding_retriever.query_embedding
+            - sender: embedding_retriever.documents
+              receiver: document_joiner.documents
+            - sender: document_joiner.documents
+              receiver: ranker.documents
+            - sender: ranker.documents
+              receiver: sentence_window_retriever.retrieved_documents
+            - sender: sentence_window_retriever.context_documents
+              receiver: window_joiner.documents
+            - sender: window_joiner.documents
+              receiver: ranker_scoring.documents
+            - sender: ranker_scoring.documents
+              receiver: meta_field_grouping_ranker.documents
+            - sender: meta_field_grouping_ranker.documents
+              receiver: result_formatter.documents
+      # TOOL 4 (v1.1, not included): get_file_outline(file_id) - filter_documents sorted
+      # by split_id returning header/parent_headers, for when in-file search misses.
+      # See design doc §4.4. If it must be stateless it can use deepset's native CodeTool
+      # (deepset_cloud_custom_nodes.tools.code_tool.CodeTool, @tool function in `code`),
+      # but like list_corpus_files it needs the entitlement filters, so PipelineTool.
+      # ---------------------------------------------------------------------------
+      # OPTIONAL [O2]: if the app persists the `messages` output verbatim and chokes on
+      # tool-call/tool-result messages, filter them inside citation_renumberer (it already
+      # rebuilds the list) rather than adding another component: return only the rewritten
+      # assistant message instead of `rebuilt`.
+      # ---------------------------------------------------------------------------
+connections:
+- sender: attachment_converter.documents
+  receiver: attachment_metadata_stamper.documents
+- sender: attachment_metadata_stamper.documents
+  receiver: attachment_formatter.documents
+- sender: attachment_formatter.documents
+  receiver: agent.documents
+- sender: attachment_formatter.result
+  receiver: agent.attachments
+- sender: history_sanitizer.messages
+  receiver: agent.messages
+# DRAFT 9c: the agent's outputs go through citation_renumberer before leaving the pipeline.
+- sender: agent.messages
+  receiver: citation_renumberer.messages
+- sender: agent.documents
+  receiver: citation_renumberer.documents
+max_runs_per_component: 100
+metadata: {}
+# CONTRACT: identical inputs/outputs to v0.x - the app does not change. Only the producer
+# of `documents` and `messages` moved from the agent to citation_renumberer (draft 9c).
+inputs:
+  query:
+  - agent.query
+  filters:
+  - agent.filters
+  messages:
+  - history_sanitizer.messages
+  files:
+  - attachment_converter.sources
+outputs:
+  documents: citation_renumberer.documents
+  messages: citation_renumberer.messages
+pipeline_output_type: chat

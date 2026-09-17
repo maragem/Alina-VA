@@ -1,0 +1,566 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+.conversation-search::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
+}
+
+@custom-variant dark (&:is(.dark *));
+@plugin "@tailwindcss/typography";
+
+:root {
+  --ec-blue: #003399;
+  --ec-blue-soft: #0e47cb;
+  --ec-blue-100: #c7d4ec;
+  --ec-yellow: #ffcc00;
+  --ec-ink: #1a1a1a;
+  --ec-mute: #5c5c5c;
+  --ec-line: #d8d8d8;
+  --ec-surface: #f5f7fa;
+  --ec-card: #ffffff;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.4 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --radius: 0.625rem;
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sans);
+  --font-serif: var(--font-noto-serif);
+  --font-heading: var(--font-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  font-family: var(--font-source-sans-3), "Source Sans 3", "Noto Sans", system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--ec-yellow);
+  outline-offset: 2px;
+}
+
+.ec-card {
+  background: var(--ec-card);
+  border: 1px solid var(--ec-line);
+  box-shadow: 0 1px 0 rgba(0, 51, 153, 0.06), 0 4px 16px rgba(0, 51, 153, 0.04);
+}
+
+.ec-input {
+  width: 100%;
+  border: 1px solid var(--ec-line);
+  background: #fff;
+  padding: 0.625rem 0.75rem;
+  font-size: 0.875rem;
+  color: var(--ec-ink);
+}
+
+.ec-input::placeholder {
+  color: var(--ec-mute);
+}
+
+.ec-input:focus {
+  border-color: var(--ec-blue);
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(255, 204, 0, 0.6);
+}
+
+.ec-btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: var(--ec-blue);
+  color: #fff;
+  font-size: 0.875rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  padding: 0.625rem 1rem;
+  cursor: pointer;
+}
+
+.ec-btn-primary:hover {
+  background: var(--ec-blue-soft);
+}
+
+.ec-nav-tab {
+  border-bottom: 4px solid transparent;
+  color: var(--ec-blue-100);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.875rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 0.8rem 1rem;
+  text-transform: uppercase;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+.ec-nav-tab.active {
+  color: #fff;
+  border-bottom-color: var(--ec-yellow);
+}
+
+.ec-nav-tab.inactive:hover {
+  color: #fff;
+  border-bottom-color: var(--ec-blue-100);
+}
+
+/* Motion foundation: durations, easing, and animation utilities. */
+:root {
+  --motion-duration-fast: 180ms;
+  --motion-duration-normal: 260ms;
+  --motion-duration-slow: 360ms;
+  --motion-duration-slower: 420ms;
+  --motion-duration-drawer: 420ms;
+  
+  --motion-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --motion-ease-in: cubic-bezier(0.7, 0, 0.84, 0);
+  --motion-ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  /* Spring-like overshoot for expressive entrances. */
+  --motion-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* Fade animations: opacity only. */
+@keyframes fade-in {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+@keyframes fade-out {
+  0% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* Subtle entrance: fade and small rise, no bounce or scale. Used for chat messages. */
+@keyframes message-in {
+  0% {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Lift and scale: entrance for dialogs, toasts, buttons. */
+@keyframes lift-in {
+  0% {
+    opacity: 0;
+    transform: translateY(16px) scale(0.94);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes lift-out {
+  0% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(16px) scale(0.94);
+  }
+}
+
+/* Scale entrance for dialog panels: larger initial scale. */
+@keyframes scale-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.85) translateY(12px);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+@keyframes scale-out {
+  0% {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0.85) translateY(12px);
+  }
+}
+
+/* Slide left for drawer: transform only to enable GPU acceleration. */
+@keyframes slide-in-left {
+  0% {
+    opacity: 0;
+    transform: translateX(-100%);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes slide-out-left {
+  0% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(-100%);
+  }
+}
+
+/* Staggered list items: fade and lift for each child in sequence. */
+@keyframes list-item-in {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Status transition: subtle cross-fade for chip label/icon changes. */
+@keyframes status-fade-through {
+  0% { opacity: 1; }
+  45% { opacity: 0.25; }
+  100% { opacity: 1; }
+}
+
+/* Indeterminate progress bar: animated stripes. */
+@keyframes progress-stripes {
+  0% {
+    background-position: 0 0;
+  }
+  100% {
+    background-position: 2rem 0;
+  }
+}
+
+/* Ellipsis for in-progress status labels: cycles through ".", "..", "...". */
+@keyframes status-dots {
+  0%, 100% { clip-path: inset(0 100% 0 0); }
+  25% { clip-path: inset(0 66% 0 0); }
+  50% { clip-path: inset(0 33% 0 0); }
+  75% { clip-path: inset(0 0 0 0); }
+}
+
+/* Utility classes for motion. Apply via Tailwind class names. */
+@layer utilities {
+  /* Fade utilities: reusable entrance/exit. */
+  .animate-fade-in {
+    animation: fade-in var(--motion-duration-normal) var(--motion-ease-out) forwards;
+  }
+  
+  .animate-fade-out {
+    animation: fade-out var(--motion-duration-normal) var(--motion-ease-in) forwards;
+  }
+  
+  /* Lift and scale: for small confirmations, buttons, scroll controls. */
+  .animate-lift-in {
+    animation: lift-in var(--motion-duration-normal) var(--motion-ease-spring) forwards;
+  }
+  
+  /* Subtle fade and rise: for chat messages, keeps things professional and calm.
+     No "forwards" fill mode: the animation's end state (opacity 1, no transform)
+     matches the element's base styles, and a lingering transform here would create
+     a containing block that breaks any `position: fixed` overlay (e.g. source
+     preview panel) rendered inside a chat message. */
+  .animate-message-in {
+    animation: message-in var(--motion-duration-normal) var(--motion-ease-out);
+  }
+  
+  .animate-lift-out {
+    animation: lift-out var(--motion-duration-fast) var(--motion-ease-in) forwards;
+  }
+  
+  /* Scale entrance: for dialogs and overlays. */
+  .animate-scale-in {
+    animation: scale-in var(--motion-duration-normal) var(--motion-ease-spring) forwards;
+  }
+  
+  .animate-scale-out {
+    animation: scale-out var(--motion-duration-fast) var(--motion-ease-in) forwards;
+  }
+  
+  .animate-scale-in-slow {
+    animation: scale-in var(--motion-duration-slow) var(--motion-ease-spring) forwards;
+  }
+  
+  /* Drawer slide: longer for mobile drawer (420ms). */
+  .animate-slide-in-left {
+    animation: slide-in-left var(--motion-duration-drawer) var(--motion-ease-spring) forwards;
+  }
+  
+  .animate-slide-out-left {
+    animation: slide-out-left var(--motion-duration-normal) var(--motion-ease-in) forwards;
+  }
+  
+  /* Status transitions: brief fade-through. */
+  .animate-status-fade {
+    animation: status-fade-through var(--motion-duration-normal) ease-in-out 1;
+  }
+  
+  /* List stagger: apply to individual children with calc() delay. */
+  .animate-list-item-in {
+    animation: list-item-in var(--motion-duration-normal) var(--motion-ease-spring) backwards;
+  }
+  
+  /* Indeterminate progress bar. */
+  .animate-progress-stripes {
+    background-size: 2rem 100%;
+    animation: progress-stripes 1.5s linear infinite;
+  }
+  
+  /* Cycling ellipsis for status labels awaiting a result. */
+  .animate-status-dots {
+    animation: status-dots 1.2s steps(1) infinite;
+  }
+  
+  /* Transition durations: for transition-all and state property changes. */
+  .transition-fast {
+    transition-duration: var(--motion-duration-fast);
+  }
+  
+  .transition-normal {
+    transition-duration: var(--motion-duration-normal);
+  }
+  
+  .transition-slow {
+    transition-duration: var(--motion-duration-slow);
+  }
+  
+  /* Respect prefers-reduced-motion: remove animations but preserve visibility. */
+  @media (prefers-reduced-motion: reduce) {
+    .animate-fade-in,
+    .animate-fade-out,
+    .animate-lift-in,
+    .animate-lift-out,
+    .animate-message-in,
+    .animate-scale-in,
+    .animate-scale-out,
+    .animate-scale-in-slow,
+    .animate-slide-in-left,
+    .animate-slide-out-left,
+    .animate-status-fade,
+    .animate-list-item-in,
+    .animate-progress-stripes,
+    .animate-status-dots {
+      animation: none !important;
+      opacity: 1 !important;
+      transform: none !important;
+    }
+    
+    /* Ensure elements are visible without animation. */
+    .animate-scale-in,
+    .animate-scale-in-slow {
+      transform: scale(1) !important;
+    }
+    
+    .animate-slide-in-left {
+      transform: translateX(0) !important;
+    }
+  }
+}
+
+/* Scoped overrides for docx-preview's generated document pages. */
+.docx-preview .docx-wrapper {
+  background: transparent;
+  padding: 0;
+}
+
+.docx-preview .docx {
+  width: min(100%, 52rem) !important;
+  min-height: auto !important;
+  margin: 0 auto 1.5rem !important;
+  padding: clamp(1.5rem, 5vw, 4rem) !important;
+  background: #fff !important;
+  color: var(--ec-ink) !important;
+  box-shadow: 0 1px 0 rgba(0, 51, 153, 0.06), 0 8px 24px rgba(15, 23, 42, 0.1) !important;
+}
+
+.docx-preview .docx:last-child {
+  margin-bottom: 0 !important;
+}
+
+.docx-preview .docx :is(p, li, td, th) {
+  color: var(--ec-ink);
+  font-family: var(--font-source-sans-3), "Source Sans 3", "Noto Sans", sans-serif;
+  line-height: 1.6;
+}
+
+.docx-preview .docx :is(h1, h2, h3, h4, h5, h6) {
+  color: var(--ec-blue);
+  font-family: var(--font-source-sans-3), "Source Sans 3", "Noto Sans", sans-serif;
+  line-height: 1.25;
+}
+
+.docx-preview .docx h1 {
+  font-size: 1.75rem;
+}
+
+.docx-preview .docx h2 {
+  font-size: 1.35rem;
+}
+
+.docx-preview .docx h3 {
+  font-size: 1.125rem;
+}
+
+.docx-preview .docx table {
+  width: 100% !important;
+  margin: 1rem 0;
+  border-collapse: collapse;
+}
+
+.docx-preview .docx :is(td, th) {
+  border-color: var(--ec-line) !important;
+  padding: 0.45rem 0.6rem !important;
+  vertical-align: top;
+}
+
+.docx-preview .docx th {
+  background: #f5f7fa;
+  font-weight: 700;
+}
+
+.docx-preview .docx img {
+  max-width: 100% !important;
+  height: auto !important;
+}
+
+.docx-preview .docx :is(ol, ul) {
+  padding-left: 1.5rem;
+}
+
+mark[data-alina-citation] {
+  background-color: #ffe066;
+  color: inherit;
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}

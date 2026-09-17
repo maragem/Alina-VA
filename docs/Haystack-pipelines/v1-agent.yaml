@@ -1,0 +1,1198 @@
+# haystack-pipeline
+# ALINA v1 - AGENT pipeline DIGIT.R3 (DRAFT 7 - streaming disabled on the agent)
+#
+# DRAFT 7: `streaming_callback` removed from the agent. Both traces show tool_invoker as a
+# no-op (16ms, 6ms), i.e. the first generator call returns an empty assistant message every
+# single time - so the cause is structural, not per-tool. The one thing v0.x never did
+# through this EC proxy is send `tools`, and tool calls stream as different SSE events than
+# text. Full reasoning at the streaming_callback site.
+#
+# TWO CHECKS THAT SETTLE THIS - do them before changing anything else:
+#   A. Logs tab of a failing run: look for the warning "malformed JSON string for tool call
+#      arguments ... will be skipped". PRESENT -> the model did emit a tool call and its
+#      arguments were lost in transport (streaming): draft 7 is the fix. ABSENT -> the
+#      provider returned nothing usable at all, and the problem is upstream of Haystack.
+#   B. Isolation test, 5 minutes: a throwaway pipeline with this same chat_generator, no
+#      streaming, and ONE trivial deepset CodeTool (the get_weather @tool example from the
+#      docs). Ask it "what is the weather in Brussels". If no tool call happens there
+#      either, the EC gpt-5.1 endpoint does not do tool calling in the shape Haystack
+#      sends, and no amount of pipeline YAML will fix it - see PLAN B below.
+#
+# PLAN B if tool calling is unavailable through this endpoint: keep the v0.x fixed chain and
+# solve the named-document problem WITHOUT an agent - a ConditionalRouter in front of
+# retrieval, fed by a small extraction step that spots a document reference in the query and
+# resolves it against the file list, then routes to a file-filtered branch or the normal one.
+# Less flexible than an agent, but it needs no tool calling at all.
+#
+# DRAFT 6: every tool now declares its LLM-facing `parameters` schema explicitly instead
+# of letting PipelineTool derive it from input_mapping. Deriving it exposed `filters` and
+# `state_documents` (list[Document]) as model-supplied arguments, which produced malformed
+# tool-call arguments; Haystack drops such a call silently and hands back an EMPTY
+# assistant message, which then kills the next loop iteration. Full chain of evidence in
+# the comment above search_corpus.parameters.
+#
+# One diagnostic setting is still on: `generation_kwargs: {}` (reasoning off), kept only
+# so this fix is tested in isolation. Restore `reasoning_effort: medium` once green.
+#
+# DRAFT 4 (runtime): deepset's replayed chat history must be sanitized before it reaches
+# the Agent. The app sends no `messages`; deepset rebuilds prior turns from
+# search_session_id, and now that assistant turns carry tool calls, a content-less
+# ChatMessage can appear and the generator rejects it on outgoing serialization. See the
+# history_sanitizer component.
+#
+# DRAFT 3 (runtime): document stores MUST be declared in YAML, never built in Python.
+# deepset injects the real cluster host/credentials when a store is deserialized from the
+# YAML; a store constructed inside a Code component skips that hook and tries
+# localhost:9200. list_corpus_files now scans through a FilterRetriever (store in YAML)
+# and its Code component only reduces chunks to a file listing. See the tool for detail.
+#
+# See v1-agent-design.md for the full rationale. In one line: the v0.x fixed chain cannot
+# answer "what does <named document> say about X" from the named document, because nothing
+# resolves the name or constrains retrieval to it. This pipeline gives the LLM three tools
+# (list_corpus_files, search_corpus, search_in_file) and lets it decide.
+#
+# CONTRACT: only the v0.x pipeline I/O is kept. Same inputs (query, filters, messages,
+# files), same outputs (documents, messages), same streaming callback, pipeline_output_type
+# chat. Switching the app to this pipeline is a HAYSTACK_PIPELINE(_ID) env change only.
+#
+# ========================= DRAFT 2: WHAT THE FIRST IMPORT TAUGHT US =========================
+# The first import into deepset resolved most of the [U1]/[U2] uncertainty:
+#
+#   1. inputs_from_state maps {state_key: tool_parameter_name} with a STRING value
+#      (import error: "inputs_from_state values must be str, not list"). The fan-out to
+#      internal sockets stays in input_mapping, which DOES take lists. So a state-fed
+#      value needs BOTH entries:
+#          input_mapping:      state_documents: [result_formatter.state_documents]
+#          inputs_from_state:  documents: state_documents
+#   2. outputs_to_state has the shape {state_key: {source: <tool output name>}}.
+#   3. outputs_to_string: {source: <tool output name>} selects what the LLM receives as
+#      the tool result. Without it the tool would return ALL mapped outputs serialized,
+#      including the raw Document list - a context bomb. Required on both search tools.
+#   4. deepset's native custom-code tool is deepset_cloud_custom_nodes.tools.code_tool.CodeTool
+#      with data: {name, description, code} where code holds a @tool-decorated FUNCTION
+#      (haystack.tools.tool, Annotated params), plus a _meta block (Builder bookkeeping).
+#      It is NOT the ComponentTool-wrapping-a-Code-component shape of draft 1.
+#      list_corpus_files is nevertheless kept as a PipelineTool below, because it MUST
+#      receive the entitlement filters from state and the CodeTool path has no documented
+#      inputs_from_state - see the tool's own comment.
+#
+# STILL UNVERIFIED:
+#   [U1'] Whether parameters fed via inputs_from_state are hidden from the LLM's tool
+#         schema, and whether state values take precedence if the model supplies them
+#         anyway. SECURITY-RELEVANT for `filters`: verify in the playground by prompting
+#         the agent to pass its own filters and checking they are ignored. If they are
+#         not, guard inside the tool pipelines (ignore any filters argument not coming
+#         from state).
+#   [U3]  Wiring pipeline inputs / connections into Agent state fields (filters,
+#         documents seed) and into user_prompt variables (attachments).
+#   [U4]  Append semantics of list-typed state fields (design assumes haystack State's
+#         default list-merge behaviour, i.e. extend).
+# ============================================================================================
+#
+# ENTITLEMENT INVARIANT (unchanged from v0.x): the request's `filters` carry per-user /
+# per-project document entitlement. They are injected server-side into EVERY tool via agent
+# state; the LLM never sees or sets them. file_ids chosen by the LLM are ANDed with these
+# filters, so a hallucinated or non-entitled file_id returns zero documents, never a leak.
+# The v0.8 warning applies verbatim: test the empty-filters path of file_filter_merger
+# carefully - a mistake here has access-control consequences, not just relevance ones.
+#
+# CITATION SCHEME: agent state accumulates documents across tool calls in call order; the
+# pipeline `documents` output is that list, unreordered. Each tool's result_formatter
+# numbers passages globally (offset = len(state.documents)) and dedups by document id, so
+# [n] in the answer always maps to documents[n-1] in the sources panel. Authority grouping
+# (meta_field_grouping_ranker) runs INSIDE each tool, before appending - never after the
+# agent, where it would break the numbering.
+
+components:
+
+  # ---------------------------------------------------------------------------
+  # Attachment branch (carried over from the v0.9 draft, still UNVERIFIED there)
+  # Attachments seed the agent's documents state (references 1..k) and are rendered
+  # into the first user turn, so they are always in context without any tool call.
+  # ---------------------------------------------------------------------------
+  attachment_converter:
+    type: haystack.components.converters.multi_file_converter.MultiFileConverter
+    init_parameters: {}
+
+  attachment_metadata_stamper:
+    # authority_rank=0 (above every corpus source), sequential split_id, header
+    # "Attached file: <name>" - same stamping as v0.9.
+    type: deepset_cloud_custom_nodes.code.code_component.Code
+    init_parameters:
+      code: |
+        from haystack import component
+        from haystack.dataclasses import Document
+
+        @component
+        class AttachmentMetadataStamper:
+            """Stamps attachments with the metadata the grouping/formatting layer expects."""
+
+            @component.output_types(documents=list[Document])
+            def run(self, documents: list[Document]):
+                for split_id, document in enumerate(documents):
+                    document.meta["authority_rank"] = 0
+                    document.meta.setdefault("file_id", document.id)
+                    document.meta["split_id"] = split_id
+                    file_name = document.meta.get("file_name", "attached file")
+                    document.meta["header"] = f"Attached file: {file_name}"
+                return {"documents": documents}
+
+  attachment_formatter:
+    # Same rendering/numbering logic as the in-tool result_formatter, with an empty
+    # state: attachments take references 1..k. Outputs both the rendered block (into
+    # the user_prompt) and the documents (seeding agent state). [U3]
+    type: deepset_cloud_custom_nodes.code.code_component.Code
+    init_parameters:
+      code: |
+        from haystack import component
+        from haystack.dataclasses import Document
+
+        PER_DOC_CHARS = 12000
+
+        @component
+        class AttachmentFormatter:
+            @component.output_types(documents=list[Document], result=str)
+            def run(self, documents: list[Document]):
+                blocks = []
+                for ref, doc in enumerate(documents, start=1):
+                    full = doc.content or ""
+                    body = full[:PER_DOC_CHARS]
+                    truncated = ' truncated="true"' if len(full) > len(body) else ""
+                    tail = "\n[... this passage continues beyond what is shown here ...]" if truncated else ""
+                    blocks.append(
+                        f'<document reference="{ref}" source="{doc.meta.get("file_name")}" '
+                        f'section="{doc.meta.get("header")}" page="{doc.meta.get("page_number")}"{truncated}>\n'
+                        f"{body}{tail}\n</document>"
+                    )
+                result = "<documents>\n" + "\n".join(blocks) + "\n</documents>" if blocks else ""
+                return {"documents": documents, "result": result}
+
+  history_sanitizer:
+    # ======================= DRAFT 4 FIX =======================
+    # Symptom: OpenAIResponsesChatGenerator fails with
+    #   A `ChatMessage` must contain at least one `TextContent`, `ToolCall`,
+    #   `ToolCallResult`, `ImageContent`, `FileContent`, or `ReasoningContent`.
+    #
+    # That check lives in _convert_chat_message_to_responses_api_format(), i.e. on the
+    # OUTGOING serialization of the conversation. So the offending message is already in
+    # the list the agent replays - it is not something the model returned.
+    #
+    # Where it comes from: the application does NOT send `messages`. It sends
+    # search_session_id + chat_history_limit: 20 (see search-stream/route.ts) and deepset
+    # reconstructs the prior turns into this pipeline's `messages` input. In v0.x that
+    # history was only ever rendered as Jinja inside chat_prompt_builder, so a
+    # content-less message rendered as an empty string and nobody noticed. An Agent hands
+    # the same list straight to the generator, which validates every message. Two ways a
+    # content-less message appears now that the assistant's turns carry tool calls:
+    #   - a stored assistant turn whose content was only a tool call / only reasoning,
+    #     replayed with that part dropped -> a message with nothing in it;
+    #   - chat_history_limit truncating between a function_call and its
+    #     function_call_output, orphaning one of the pair.
+    #
+    # Fix: rebuild the history as plain user/assistant TEXT turns before it reaches the
+    # agent. This is also what the design intended - history is context for resolving
+    # follow-ups, not source material, and never the agent's own tool trace (the agent
+    # re-runs its tools every turn, and citation numbering restarts per turn anyway).
+    # Side benefit: it drops the replayed tool results, which were pure context cost.
+    #
+    # If the error survives this, the empty message is being produced INSIDE the agent
+    # loop instead (a streamed turn whose text was empty and whose tool-call arguments
+    # failed to parse). Diagnosis: does it fail on the very first question of a fresh
+    # conversation (-> inside the loop) or only on a follow-up (-> history, fixed here)?
+    # In the first case the levers are the streaming assembly and reasoning_effort, not
+    # this component.
+    # ===========================================================
+    type: deepset_cloud_custom_nodes.code.code_component.Code
+    init_parameters:
+      code: |
+        from haystack import component
+        from haystack.dataclasses import ChatMessage
+
+        MAX_HISTORY_MESSAGES = 20
+
+        @component
+        class HistorySanitizer:
+            """Rebuilds replayed history as plain user/assistant text turns.
+
+            Guarantees every message handed to the generator carries a TextContent:
+            anything content-less, any tool-call / tool-result / reasoning residue, and
+            any role other than user/assistant is dropped rather than passed through.
+            """
+
+            @component.output_types(messages=list[ChatMessage])
+            def run(self, messages: list[ChatMessage] | None = None):
+                clean: list[ChatMessage] = []
+                for message in messages or []:
+                    role = getattr(message.role, "value", message.role)
+                    if role not in ("user", "assistant"):
+                        continue
+                    try:
+                        text = (message.text or "").strip()
+                    except Exception:
+                        text = ""
+                    if not text:
+                        continue
+                    clean.append(
+                        ChatMessage.from_user(text)
+                        if role == "user"
+                        else ChatMessage.from_assistant(text)
+                    )
+                return {"messages": clean[-MAX_HISTORY_MESSAGES:]}
+
+  # ---------------------------------------------------------------------------
+  # THE AGENT
+  # ---------------------------------------------------------------------------
+  agent:
+    type: haystack.components.agents.agent.Agent
+    init_parameters:
+      chat_generator:
+        # ===================== DRAFT 8: CHAT COMPLETIONS, NOT RESPONSES =====================
+        # v0.x used OpenAIResponsesChatGenerator (/responses) and worked - but it never sent
+        # `tools`. Test B proved the endpoint is the problem, not our YAML: a throwaway
+        # pipeline with ONE CodeTool whose schema is two plain strings, no PipelineTool, no
+        # retrieval, no state, no streaming, failed with the identical empty-ChatMessage
+        # error. The /responses endpoint answers 200 with output that maps to no tool call,
+        # so Haystack builds an empty assistant message and dies re-serializing it.
+        #
+        # This switches to /chat/completions, where function calling is long-standing and
+        # universally implemented by gateways.
+        #
+        # CONFIRMED 31/08/2026: test B2 (same throwaway pipeline, this generator) calls its
+        # tool correctly. The ECGPT gateway does function calling on /chat/completions and
+        # not on /responses. Do not switch this back.
+        #
+        # Note: `reasoning_effort` (v0.x) is a Responses-API parameter. On Chat Completions
+        # pass it inside generation_kwargs only after checking the gateway accepts it -
+        # an unknown parameter is a 400 here, not a silent ignore.
+        # ===================================================================================
+        type: haystack.components.generators.chat.openai.OpenAIChatGenerator
+        init_parameters:
+          model: gpt-5.1
+          api_key:
+            type: env_var
+            strict: true
+            env_vars:
+            - GPTEC_API_KEY
+          api_base_url: https://api.tech.ec.europa.eu/ecgpt/v1
+          # ======================= DRAFT 5 DIAGNOSTIC (HYPOTHESIS DISPROVED) ==========
+          # `reasoning_effort: medium` (carried over from v0.x) is still disabled here,
+          # but ONLY to keep one variable at a time while the draft-6 tool-schema fix is
+          # tested. Reasoning was NOT the cause: the failure reproduced identically with
+          # it off. RESTORE `reasoning_effort: medium` once the run is green.
+          # The original (wrong) reasoning is kept below for the record.
+          #
+          # The trace shows chat_generator(922ms, ok) -> tool_invoker(16ms, ok) ->
+          # chat_generator(15ms, FAIL), all inside ONE Agent Run. 15ms means it died
+          # before any network round trip, i.e. while serializing the conversation. The
+          # raise condition is
+          #   not any([texts, tool_calls, tool_call_results, images, reasonings, files])
+          # so a message with a ToolCall passes, and one with ReasoningContent passes:
+          # the offending message has literally nothing. Since call 1 succeeded on the
+          # same list minus the last two entries, the empty message is one the LOOP
+          # added - it cannot come from replayed history, and history_sanitizer cannot
+          # fix it.
+          #
+          # What produces a content-less message there: on the Responses API a reasoning
+          # model returns a `reasoning` item alongside the `function_call` item. With an
+          # effort set but NO summary requested, that reasoning item carries no text, so
+          # the ChatMessage built from it ends up empty - fine on the way out of the
+          # model, fatal when the loop serializes it back on the next iteration.
+          #
+          # TEST: run the client's question again with reasoning off.
+          #   - error gone  -> confirmed. Re-enable reasoning WITH a summary so the
+          #                    reasoning content is never empty:
+          #                      generation_kwargs:
+          #                        reasoning:
+          #                          effort: medium
+          #                          summary: auto
+          #                    (the app already sends include_reasoning: true, so a
+          #                    summary is what it expects to stream anyway)
+          #   - error stays -> the empty message comes from the streaming assembly
+          #                    instead: drop `streaming_callback` from the agent for one
+          #                    run to confirm, then stream from a trailing component.
+          # =================================================================
+          generation_kwargs: {}
+
+      # ======================= DRAFT 7: STREAMING DISABLED =======================
+      # Streaming is OFF. This is the last untested variable behind the empty-message
+      # failure, and it is now the prime suspect.
+      #
+      # What both traces actually show: tool_invoker returned in 16ms, then 6ms. Both are
+      # NO-OPS - no tool has ever actually executed. So the first generator call returns
+      # an empty assistant message EVERY time, not intermittently. That rules out a
+      # per-tool schema problem and points at something structural.
+      #
+      # What is structurally new versus v0.x: v0.x used this same generator, through this
+      # same EC proxy, with this same streaming callback, and streamed text fine - but it
+      # never sent `tools`. Tool calls stream as a DIFFERENT set of SSE events than text
+      # (function-call argument deltas). A gateway that implements text streaming but not
+      # those events leaves Haystack accumulating an empty arguments string; the assembler
+      # then drops the tool call with only a log warning and returns
+      #   ChatMessage.from_assistant(text=None, tool_calls=[], ...)
+      # 885ms of real latency with 0 recorded tokens fits: the response was streamed and
+      # not understood.
+      #
+      # CONSEQUENCE: answers arrive in one block instead of token by token. The app copes -
+      # search-stream/route.ts already finalizes from the result event (finalizeBlock /
+      # parseHaystackResultEvent), streamedText simply stays empty.
+      #
+# UPDATE: streaming was NOT the cause (test B1 failed with it off). It stays off for the
+      # FIRST deployment of this draft only, because test B2 validated tool calling in the
+      # unstreamed configuration and one variable should move at a time after seven
+      # deployments spent on compound uncertainty.
+      #
+      # STEP 2, once the two golden questions pass: uncomment the line below and redeploy.
+      # That verifies streaming works with tool calls on /chat/completions. If the empty
+      # message returns at that point, streaming is the culprit after all and the fallback
+      # is to keep the agent unstreamed - the app copes (finalizeBlock in route.ts).
+      #   streaming_callback: deepset_cloud_custom_nodes.callbacks.streaming.streaming_callback
+      # ===========================================================================
+
+      exit_conditions:
+      - text
+      # Bounds cost/latency AND total document accumulation. ~3 tool rounds + answer.
+      max_agent_steps: 8
+
+      # Kept at the default. Turning this on in draft 5 proved nothing, and that was
+      # itself informative: no tool invocation was failing because no tool was being
+      # invoked at all (tool_invoker returning in 6ms is a no-op, not a fast failure).
+      raise_on_tool_invocation_failure: false
+
+      # [U3] documents is seeded by attachment_formatter and appended to by both search
+      # tools; filters comes straight from the pipeline input and is read-only for tools.
+      state_schema:
+        documents:
+          type: list[haystack.dataclasses.document.Document]
+        filters:
+          type: dict
+
+      # Derived from the v0.6 system prompt. Edits: "documents supplied in the user
+      # message" -> "documents returned by your tools"; new "Using your tools" section;
+      # the three pre-answer checks moved here from the old user-turn template.
+      # |- literal block in this source file; the Builder re-serializes to >- with blank
+      # lines on export, which is equivalent - do not "fix" the export back by hand.
+      system_prompt: |-
+        {% message role="system" %}
+        You are ALINA, the AI assistant of the European Commission's DIGIT.R3 procurement
+        division: a source-grounded assistant for procurement and contract intelligence.
+        You answer strictly from a curated corpus of procurement documents (legal acts,
+        internal rules, guidance, tender documents, Q&A logs) that you access through your
+        search tools, plus any files the user attached to the conversation.
+
+        # Using your tools
+
+        - `list_corpus_files`: lists the documents you can access, optionally filtered by
+          a name pattern. Use it FIRST whenever the user refers to a specific document by
+          name, alias or abbreviation ("the FR", "the vademecum", "document X"), to
+          resolve it to an exact file_name and file_id.
+        - `search_in_file`: searches inside specific documents (by file_id). Use it
+          whenever the user asks what a specific document says, defines or requires.
+        - `search_corpus`: searches the whole corpus. Use it for every other question,
+          and to check whether a higher-authority source also states a rule you found
+          elsewhere.
+
+        Rules:
+        - When the user targets a named document: resolve the name, then search inside
+          that document. If the document does not contain the requested information, say
+          so explicitly, and only then present what other retrieved sources say, clearly
+          attributed to them. Never silently substitute another source for the named one.
+        - If no accessible file matches the name, say so. Do not guess at documents.
+        - Formulate short, self-contained search queries (keywords, synonyms, article
+          terms). Never paste conversation history into a query. Reformulate and search
+          again if a first search misses; stop searching as soon as the passages answer
+          the question.
+        - A greeting or a remark that is not a question about the corpus needs no tools:
+          reply briefly and naturally.
+
+        # Before answering, check
+
+        1. Answerability: retrieval always returns the closest matches, so tool results
+           sharing the question's topic do not prove the question is answerable. If the
+           passages do not actually contain the requested information, or the question
+           concerns case-specific or operational data outside this corpus, say you cannot
+           answer from the available documents instead of building an answer from loosely
+           related passages.
+        2. Completeness: after finding the general rule, re-read every passage for
+           exceptions, derogations, extensions, thresholds and special cases ("unless",
+           "except", "however", "may be extended", "by way of derogation", "in duly
+           justified cases") and include every applicable one. Distinguish mandatory from
+           discretionary.
+        3. Source selection: when several documents state the same rule, answer from the
+           highest-authority source: legal acts (Financial Regulation and annexes, EU
+           directives) above internal rules, decisions and circulars, above guidance and
+           the vademecum, above project tender specifications, above Q&A logs, checklists
+           and correspondence. Cite the exact section that answers, not a neighbour.
+
+        # Grounding
+
+        - Base every factual statement exclusively on passages returned by your tools or
+          attached by the user. No outside knowledge, no assumptions, no invented
+          references, figures, dates, clauses or article numbers.
+        - If the documents only partially answer, answer the supported part and flag what
+          remains unanswered. If documents conflict, present both positions with sources.
+        - A passage tagged truncated="true" continues beyond the text you received: never
+          treat the cut-off as the end of a provision, and say so if the answer may
+          depend on the missing part.
+        - Never mention or reconstruct documents the user has not been given access to.
+
+        # Citing and quoting
+
+        - Support every claim with a short verbatim quotation in quotation marks followed
+          by the passage's reference number in square brackets, e.g. [3], inline, next to
+          the claim. Reference numbers are the ones shown in the tool results and are
+          global across the whole conversation turn: never renumber, never invent one.
+        - Quoted text must be an exact substring of a retrieved passage. If you cannot
+          locate the exact wording, paraphrase without quotation marks and cite, or state
+          the information is missing.
+
+        # Style
+
+        - Professional, precise, neutral, suited to an EU institutional context. Markdown.
+        - The first paragraph must contain the complete direct answer; supporting quotes
+          and detail follow. Be brief; no padding, no generic closing advice.
+        - Preserve exact terminology, reference numbers, dates and amounts as written.
+        - Always answer in English.
+
+        # Boundaries
+
+        - You provide information grounded in the documents; you do not give legal advice,
+          make procurement decisions, or issue binding interpretations. Where judgement
+          beyond the text is needed, state what the documents say and note the decision
+          rests with the responsible officer.
+        {% endmessage %}
+
+      # Conversation history arrives through the agent's native `messages` input; this
+      # template only carries the current turn. [U3] for the attachments variable.
+      user_prompt: |-
+        {% message role="user" %}
+        {%- if attachments %}
+        The user attached the following file(s) to this conversation. They are always
+        available context, already numbered for citation:
+        {{ attachments }}
+        {%- endif %}
+        <query>
+        {{ query }}
+        </query>
+        {% endmessage %}
+      required_variables:
+      - query
+
+      tools:
+
+      # =========================================================================
+      # TOOL 1: list_corpus_files - resolve a document name/alias to file_id(s)
+      #
+      # Deliberately a PipelineTool (single Code component), NOT deepset's native
+      # CodeTool (deepset_cloud_custom_nodes.tools.code_tool.CodeTool, @tool
+      # function): the listing MUST be restricted by the entitlement filters, which
+      # only reach a tool via inputs_from_state, and the CodeTool path has no
+      # documented state access. Project isolation depends on this: without the
+      # filters, the tool would reveal file names the user is not entitled to see.
+      # =========================================================================
+      - type: haystack.tools.pipeline_tool.PipelineTool
+        data:
+          name: list_corpus_files
+          description: >-
+            List the documents available in the corpus, optionally filtered by a
+            case-insensitive name pattern (substring or simple regex, e.g. "financial
+            regulation"). Use this FIRST whenever the user refers to a specific document
+            by name, alias or abbreviation, to resolve it to an exact file_name and
+            file_id before calling search_in_file. Returns one line per file with
+            file_name, file_id, authority metadata and chunk count; returns nothing if
+            no accessible file matches.
+          # DRAFT 6: explicit schema - see the note on search_corpus.parameters.
+          parameters:
+            type: object
+            additionalProperties: false
+            properties:
+              name_pattern:
+                type: string
+                description: >-
+                  Case-insensitive substring or simple regex matched against document
+                  file names, e.g. "financial regulation". Pass an empty string to list
+                  every accessible document.
+            required:
+            - name_pattern
+          input_mapping:
+            # LLM-provided:
+            name_pattern:
+            - lister.name_pattern
+            # State-provided (see inputs_from_state). NOTE: the filters go to the
+            # RETRIEVER, not to the Code component - the Code component never talks to
+            # OpenSearch itself (see the "document stores live in YAML" note below).
+            filters:
+            - corpus_scan.filters
+          output_mapping:
+            lister.result: result
+          inputs_from_state:
+            # {state_key: tool parameter name} - values are STRINGS (draft-2 fix).
+            filters: filters
+          outputs_to_string:
+            source: result
+          pipeline:
+            components:
+              corpus_scan:
+                # ======================= DRAFT 3 FIX =======================
+                # The previous version built an OpenSearchDocumentStore inside the Code
+                # component. That fails at runtime with
+                #   ConnectionError(HTTPConnection(host='localhost', port=9200) ...)
+                # because deepset injects the real cluster host and credentials when a
+                # document store is deserialized FROM THE YAML (its from_dict hook). A
+                # store constructed in Python never goes through that hook, so it keeps
+                # the library defaults (localhost:9200) and there is no such cluster in
+                # the container.
+                #
+                # RULE: every document store must be DECLARED IN YAML as an
+                # init_parameter of a real component. Never instantiate one in a Code
+                # component. Any store the pipeline needs must therefore be reachable
+                # through a component that accepts `document_store` - here FilterRetriever,
+                # which is exactly `filter_documents(filters)` wrapped as a component.
+                # ===========================================================
+                #
+                # Entitlement: filters arrive from agent state and are applied here, by
+                # the same code path as the other retrievers - no custom DSL, no
+                # $filters-rendering subtlety (cf. the v0.8 custom_query warning). As
+                # everywhere else in ALINA, absent filters means "the whole corpus", which
+                # is the existing semantics, not a new one.
+                #
+                # COST: this pulls every entitled chunk on each call. Acceptable at pilot
+                # scale (~100s of files) and the listing is exhaustive and deterministic.
+                # Two escalation paths when the corpus grows:
+                #   1. add `return_embedding: false` to the store below if the installed
+                #      opensearch integration supports it - it strips the 768-dim vectors
+                #      from the response, which is the bulk of the payload. VERIFY the
+                #      parameter exists before adding it: an unknown init parameter fails
+                #      the whole pipeline.
+                #   2. replace this component with an OpenSearchBM25Retriever whose query
+                #      is the name_pattern (default_field "*" makes meta.file_name
+                #      searchable, cf. v0.8) and top_k ~200: cheap and good enough to
+                #      resolve a name, but no longer an exhaustive listing.
+                # If FilterRetriever is not available in this deployment's component list,
+                # path 2 is the fallback.
+                type: haystack.components.retrievers.filter_retriever.FilterRetriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                      # return_embedding: false   # see COST note 1 above - verify first
+              lister:
+                # Pure in-memory reduction: chunks -> distinct files. Touches no service.
+                type: deepset_cloud_custom_nodes.code.code_component.Code
+                init_parameters:
+                  code: |
+                    import json
+                    import re
+
+                    from haystack import component
+                    from haystack.dataclasses import Document
+
+                    MAX_FILES = 300
+
+                    @component
+                    class CorpusFileLister:
+                        """Reduces entitled chunks to a distinct-file listing.
+
+                        Receives documents from an upstream retriever (which owns the
+                        document store), so this component never opens a connection
+                        itself. Name matching is done here, on meta.file_name: a regex
+                        when the pattern compiles, a case-insensitive substring otherwise.
+                        """
+
+                        @component.output_types(result=str)
+                        def run(self, documents: list[Document], name_pattern: str = ""):
+                            name_pattern = (name_pattern or "").strip()
+                            pattern = None
+                            if name_pattern:
+                                try:
+                                    pattern = re.compile(name_pattern, re.IGNORECASE)
+                                except re.error:
+                                    pattern = None
+                            needle = name_pattern.lower()
+
+                            files = {}
+                            for doc in documents:
+                                name = doc.meta.get("file_name") or "unknown"
+                                if pattern is not None:
+                                    if not pattern.search(name):
+                                        continue
+                                elif needle and needle not in name.lower():
+                                    continue
+                                entry = files.setdefault(name, {
+                                    "file_name": name,
+                                    "file_id": doc.meta.get("file_id"),
+                                    "authority_rank": doc.meta.get("authority_rank"),
+                                    "chunks": 0,
+                                })
+                                entry["chunks"] += 1
+
+                            listing = sorted(files.values(), key=lambda e: e["file_name"])
+                            truncated = len(listing) > MAX_FILES
+                            listing = listing[:MAX_FILES]
+                            if not listing:
+                                if name_pattern:
+                                    return {"result": (
+                                        f'No accessible document matches "{name_pattern}". '
+                                        "Try a shorter or different pattern, or call this tool "
+                                        "with an empty pattern to see what is available."
+                                    )}
+                                return {"result": "No documents are accessible in this conversation."}
+                            header = f"{len(listing)} accessible document(s)"
+                            if truncated:
+                                header += " (listing truncated - narrow the pattern)"
+                            body = "\n".join(json.dumps(e) for e in listing)
+                            return {"result": f"{header}:\n{body}"}
+            connections:
+            - sender: corpus_scan.documents
+              receiver: lister.documents
+
+      # =========================================================================
+      # TOOL 2: search_corpus - the entire v0.x retrieval chain, corpus-wide
+      # =========================================================================
+      - type: haystack.tools.pipeline_tool.PipelineTool
+        data:
+          name: search_corpus
+          description: >-
+            Search the whole document corpus with a short, self-contained query. Use for
+            any question that does not target one specific document, or to check whether
+            a higher-authority source also covers a rule found elsewhere. Returns the
+            most relevant passages, tagged with global reference numbers for citation.
+          # ======================= DRAFT 6 FIX =======================
+          # THE tool schema is now declared explicitly instead of being derived from
+          # input_mapping. This is the fix for the empty-ChatMessage failure.
+          #
+          # Chain of evidence: the trace shows chat_generator(885ms, ok) ->
+          # tool_invoker(6ms, ok) -> chat_generator(5ms, FAIL), with Total tokens 0.
+          # No tool here can run in 6ms, and a ToolInvoker that returns that fast has
+          # nothing to invoke: the assistant message carried NO tool call. In Haystack's
+          # streaming path, a tool call whose accumulated arguments are empty or invalid
+          # JSON is dropped with only a log warning, and the assembler then returns
+          #   ChatMessage.from_assistant(text=None, tool_calls=[], ...)
+          # i.e. a genuinely empty message. exit_conditions: [text] does not match it
+          # either (no text), so the loop runs again and dies serializing it.
+          #
+          # Why the arguments were malformed: without an explicit `parameters`,
+          # PipelineTool derives the LLM-facing schema from input_mapping - which here
+          # also lists `filters` and `state_documents`. The model was being asked to
+          # produce a `state_documents` argument typed list[Document]. That also answers
+          # open question [U1']: inputs_from_state does NOT hide a parameter from the
+          # schema, so state-fed inputs must be kept out of `parameters` by hand - which
+          # is a SECURITY requirement for `filters`, not only a correctness one.
+          # Consistent with list_corpus_files having worked: its only derived argument
+          # was a plain string.
+          #
+          # IF THIS IS NOT ENOUGH: the remaining suspect is the streaming assembly
+          # itself (the EC proxy may not emit argument deltas the way the assembler
+          # expects). Test by removing `streaming_callback` from the agent for one run;
+          # if that fixes it, keep the agent unstreamed and stream from a trailing
+          # component instead - the app already handles a non-streamed result event
+          # (finalizeBlock in search-stream/route.ts).
+          # ===========================================================
+          parameters:
+            type: object
+            additionalProperties: false
+            properties:
+              query:
+                type: string
+                description: >-
+                  A short, self-contained search query: keywords and the terms the
+                  documents themselves would use. Never paste conversation history.
+            required:
+            - query
+          input_mapping:
+            # LLM-provided argument -> internal pipeline sockets (lists are fine HERE):
+            query:
+            - retrieval_query.query
+            - ranker.query
+            - ranker_scoring.query
+            # State-provided (see inputs_from_state):
+            filters:
+            - bm25_retriever.filters
+            - embedding_retriever.filters
+            state_documents:
+            - result_formatter.state_documents
+          output_mapping:
+            # {pipeline output socket: tool output name}
+            result_formatter.documents: documents
+            result_formatter.result: result
+          inputs_from_state:
+            # {state_key: tool parameter name} - STRING values (draft-2 fix).
+            # [U1'] verify these are hidden from the LLM schema and win over LLM args.
+            filters: filters
+            documents: state_documents
+          outputs_to_state:
+            # New unique documents append to state.documents [U4].
+            documents:
+              source: documents
+          outputs_to_string:
+            # What the LLM receives as tool result: the rendered block only, never the
+            # serialized Document list.
+            source: result
+          pipeline:
+            components:
+              retrieval_query:
+                # v0.8 guard kept. The agent writes short queries, so this should never
+                # trigger, but it is free insurance against maxClauseCount regressions.
+                type: haystack.components.converters.output_adapter.OutputAdapter
+                init_parameters:
+                  template: '{{ query.split()[-100:] | join('' '') }}'
+                  output_type: str
+              bm25_retriever:
+                type: haystack_integrations.components.retrievers.opensearch.bm25_retriever.OpenSearchBM25Retriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                  top_k: 30
+                  fuzziness: 0
+              query_embedder:
+                type: deepset_cloud_custom_nodes.embedders.nvidia.text_embedder.DeepsetNvidiaTextEmbedder
+                init_parameters:
+                  normalize_embeddings: true
+                  model: intfloat/e5-base-v2
+                  prefix: 'query: '
+                  suffix: ''
+              embedding_retriever:
+                type: haystack_integrations.components.retrievers.opensearch.embedding_retriever.OpenSearchEmbeddingRetriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                  top_k: 30
+              document_joiner:
+                type: haystack.components.joiners.document_joiner.DocumentJoiner
+                init_parameters:
+                  join_mode: reciprocal_rank_fusion
+              ranker:
+                # v0.7 memory settings kept (batch 8; agent multiplies reranker rounds,
+                # so do NOT raise these without re-checking the OOM signature).
+                type: deepset_cloud_custom_nodes.rankers.nvidia.ranker.DeepsetNvidiaRanker
+                init_parameters:
+                  model: tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+                  top_k: 10
+                  batch_size: 8
+                  meta_fields_to_embed:
+                  - header
+                  - file_name
+                  embedding_separator: \n
+              sentence_window_retriever:
+                type: haystack.components.retrievers.sentence_window_retriever.SentenceWindowRetriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                  window_size: 1
+                  source_id_meta_field: file_id
+                  split_id_meta_field: split_id
+                  raise_on_missing_meta_fields: false
+              window_joiner:
+                type: haystack.components.joiners.document_joiner.DocumentJoiner
+                init_parameters:
+                  join_mode: concatenate
+              ranker_scoring:
+                # v0.6 fix kept: scores without trimming (top_k >= 10 * (2*1+1)).
+                type: deepset_cloud_custom_nodes.rankers.nvidia.ranker.DeepsetNvidiaRanker
+                init_parameters:
+                  model: tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+                  top_k: 30
+                  batch_size: 8
+                  meta_fields_to_embed:
+                  - header
+                  - file_name
+                  embedding_separator: \n
+                  scale_score: true
+                  calibration_factor: 1
+              meta_field_grouping_ranker:
+                # Groups by authority INSIDE the tool, before state append - never after
+                # the agent, where reordering would break citation numbering.
+                type: haystack.components.rankers.meta_field_grouping_ranker.MetaFieldGroupingRanker
+                init_parameters:
+                  group_by: authority_rank
+                  subgroup_by: file_id
+                  sort_docs_by: split_id
+              result_formatter:
+                # Global numbering + dedup against state + v0.6 context budget.
+                type: deepset_cloud_custom_nodes.code.code_component.Code
+                init_parameters:
+                  code: |
+                    from haystack import component
+                    from haystack.dataclasses import Document
+
+                    PER_DOC_CHARS = 12000
+                    MAX_DOCS_PER_CALL = 30
+
+                    @component
+                    class ResultFormatter:
+                        """Renders passages for the LLM with GLOBAL reference numbers.
+
+                        - refs continue from len(state_documents): [n] in the final answer
+                          always maps to documents[n-1] of the pipeline output.
+                        - a chunk already in state is re-rendered under its existing
+                          number but NOT appended again (outputs only new documents).
+                        """
+
+                        @component.output_types(documents=list[Document], result=str)
+                        def run(self, documents: list[Document], state_documents: list[Document] | None = None):
+                            state_documents = state_documents or []
+                            known = {d.id: i + 1 for i, d in enumerate(state_documents)}
+                            next_ref = len(state_documents) + 1
+                            new_docs, blocks = [], []
+                            for doc in documents[:MAX_DOCS_PER_CALL]:
+                                if doc.id in known:
+                                    ref = known[doc.id]
+                                else:
+                                    ref = next_ref
+                                    next_ref += 1
+                                    known[doc.id] = ref
+                                    new_docs.append(doc)
+                                full = doc.content or ""
+                                body = full[:PER_DOC_CHARS]
+                                truncated = ' truncated="true"' if len(full) > len(body) else ""
+                                tail = "\n[... this passage continues beyond what is shown here ...]" if truncated else ""
+                                blocks.append(
+                                    f'<document reference="{ref}" source="{doc.meta.get("file_name")}" '
+                                    f'section="{doc.meta.get("header")}" page="{doc.meta.get("page_number")}"{truncated}>\n'
+                                    f"{body}{tail}\n</document>"
+                                )
+                            if not blocks:
+                                result = ("No documents found for this query. Reformulate, or tell the "
+                                          "user you have no source material for this point.")
+                            else:
+                                result = ("Passages grouped by authority rank (earlier = higher legal "
+                                          "authority). Cite with the reference numbers shown.\n"
+                                          "<documents>\n" + "\n".join(blocks) + "\n</documents>")
+                            return {"documents": new_docs, "result": result}
+            connections:
+            - sender: retrieval_query.output
+              receiver: bm25_retriever.query
+            - sender: retrieval_query.output
+              receiver: query_embedder.text
+            - sender: bm25_retriever.documents
+              receiver: document_joiner.documents
+            - sender: query_embedder.embedding
+              receiver: embedding_retriever.query_embedding
+            - sender: embedding_retriever.documents
+              receiver: document_joiner.documents
+            - sender: document_joiner.documents
+              receiver: ranker.documents
+            - sender: ranker.documents
+              receiver: sentence_window_retriever.retrieved_documents
+            - sender: sentence_window_retriever.context_documents
+              receiver: window_joiner.documents
+            - sender: window_joiner.documents
+              receiver: ranker_scoring.documents
+            - sender: ranker_scoring.documents
+              receiver: meta_field_grouping_ranker.documents
+            - sender: meta_field_grouping_ranker.documents
+              receiver: result_formatter.documents
+
+      # =========================================================================
+      # TOOL 3: search_in_file - identical chain + file_id constraint
+      # Only the differences from search_corpus are commented.
+      # =========================================================================
+      - type: haystack.tools.pipeline_tool.PipelineTool
+        data:
+          name: search_in_file
+          description: >-
+            Search INSIDE one or more specific documents, identified by file_ids obtained
+            from list_corpus_files. Use whenever the user asks what a specific document
+            says, defines or requires. If this returns nothing relevant, tell the user
+            the named document does not contain it - do not silently substitute another
+            source. Returns passages tagged with global reference numbers for citation.
+          # DRAFT 6: explicit schema - see the note on search_corpus.parameters.
+          parameters:
+            type: object
+            additionalProperties: false
+            properties:
+              query:
+                type: string
+                description: >-
+                  A short, self-contained search query using the terms the document
+                  itself would use. Never paste conversation history.
+              file_ids:
+                type: array
+                items:
+                  type: string
+                description: >-
+                  file_id values returned by list_corpus_files. Only documents with
+                  these ids are searched.
+            required:
+            - query
+            - file_ids
+          input_mapping:
+            query:
+            - retrieval_query.query
+            - ranker.query
+            - ranker_scoring.query
+            # LLM-provided list of file_ids, ANDed with entitlement filters below.
+            file_ids:
+            - file_filter_merger.file_ids
+            # State-provided:
+            filters:
+            - file_filter_merger.base_filters
+            state_documents:
+            - result_formatter.state_documents
+          output_mapping:
+            result_formatter.documents: documents
+            result_formatter.result: result
+          inputs_from_state:
+            filters: filters
+            documents: state_documents
+          outputs_to_state:
+            documents:
+              source: documents
+          outputs_to_string:
+            source: result
+          pipeline:
+            components:
+              file_filter_merger:
+                # SECURITY-SENSITIVE (v0.8 warning applies): must AND, never replace,
+                # the entitlement filters. Unit-test the empty/None base_filters path.
+                # [O5] Use the exact field spelling the app sends today ("file_id" vs
+                # "meta.file_id") - check src/app/api/haystack/search-stream/route.ts.
+                type: deepset_cloud_custom_nodes.code.code_component.Code
+                init_parameters:
+                  code: |
+                    from typing import Any
+
+                    from haystack import component
+
+                    @component
+                    class FileFilterMerger:
+                        """ANDs the entitlement filters with a file_id constraint."""
+
+                        # dict[str, Any], not bare dict: the retrievers' filters input is
+                        # declared dict[str, Any] | None and haystack's connection type
+                        # check rejects an unparameterized dict as the sender.
+                        @component.output_types(filters=dict[str, Any])
+                        def run(self, file_ids: list[str], base_filters: dict[str, Any] | None = None):
+                            file_condition = {
+                                "field": "file_id",
+                                "operator": "in",
+                                "value": [str(f) for f in file_ids if f],
+                            }
+                            if not base_filters:
+                                return {"filters": {"operator": "AND", "conditions": [file_condition]}}
+                            return {"filters": {"operator": "AND", "conditions": [base_filters, file_condition]}}
+              retrieval_query:
+                type: haystack.components.converters.output_adapter.OutputAdapter
+                init_parameters:
+                  template: '{{ query.split()[-100:] | join('' '') }}'
+                  output_type: str
+              bm25_retriever:
+                type: haystack_integrations.components.retrievers.opensearch.bm25_retriever.OpenSearchBM25Retriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                  top_k: 30
+                  fuzziness: 0
+              query_embedder:
+                type: deepset_cloud_custom_nodes.embedders.nvidia.text_embedder.DeepsetNvidiaTextEmbedder
+                init_parameters:
+                  normalize_embeddings: true
+                  model: intfloat/e5-base-v2
+                  prefix: 'query: '
+                  suffix: ''
+              embedding_retriever:
+                type: haystack_integrations.components.retrievers.opensearch.embedding_retriever.OpenSearchEmbeddingRetriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                  top_k: 30
+              document_joiner:
+                type: haystack.components.joiners.document_joiner.DocumentJoiner
+                init_parameters:
+                  join_mode: reciprocal_rank_fusion
+              ranker:
+                type: deepset_cloud_custom_nodes.rankers.nvidia.ranker.DeepsetNvidiaRanker
+                init_parameters:
+                  model: tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+                  top_k: 10
+                  batch_size: 8
+                  meta_fields_to_embed:
+                  - header
+                  - file_name
+                  embedding_separator: \n
+              sentence_window_retriever:
+                type: haystack.components.retrievers.sentence_window_retriever.SentenceWindowRetriever
+                init_parameters:
+                  document_store:
+                    type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+                    init_parameters:
+                      embedding_dim: 768
+                      index: ALINA-V0.3
+                      use_ssl: false
+                  window_size: 1
+                  source_id_meta_field: file_id
+                  split_id_meta_field: split_id
+                  raise_on_missing_meta_fields: false
+              window_joiner:
+                type: haystack.components.joiners.document_joiner.DocumentJoiner
+                init_parameters:
+                  join_mode: concatenate
+              ranker_scoring:
+                type: deepset_cloud_custom_nodes.rankers.nvidia.ranker.DeepsetNvidiaRanker
+                init_parameters:
+                  model: tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+                  top_k: 30
+                  batch_size: 8
+                  meta_fields_to_embed:
+                  - header
+                  - file_name
+                  embedding_separator: \n
+                  scale_score: true
+                  calibration_factor: 1
+              meta_field_grouping_ranker:
+                type: haystack.components.rankers.meta_field_grouping_ranker.MetaFieldGroupingRanker
+                init_parameters:
+                  group_by: authority_rank
+                  subgroup_by: file_id
+                  sort_docs_by: split_id
+              result_formatter:
+                # Same code as in search_corpus - keep the two copies in sync.
+                type: deepset_cloud_custom_nodes.code.code_component.Code
+                init_parameters:
+                  code: |
+                    from haystack import component
+                    from haystack.dataclasses import Document
+
+                    PER_DOC_CHARS = 12000
+                    MAX_DOCS_PER_CALL = 30
+
+                    @component
+                    class ResultFormatter:
+                        """Renders passages for the LLM with GLOBAL reference numbers."""
+
+                        @component.output_types(documents=list[Document], result=str)
+                        def run(self, documents: list[Document], state_documents: list[Document] | None = None):
+                            state_documents = state_documents or []
+                            known = {d.id: i + 1 for i, d in enumerate(state_documents)}
+                            next_ref = len(state_documents) + 1
+                            new_docs, blocks = [], []
+                            for doc in documents[:MAX_DOCS_PER_CALL]:
+                                if doc.id in known:
+                                    ref = known[doc.id]
+                                else:
+                                    ref = next_ref
+                                    next_ref += 1
+                                    known[doc.id] = ref
+                                    new_docs.append(doc)
+                                full = doc.content or ""
+                                body = full[:PER_DOC_CHARS]
+                                truncated = ' truncated="true"' if len(full) > len(body) else ""
+                                tail = "\n[... this passage continues beyond what is shown here ...]" if truncated else ""
+                                blocks.append(
+                                    f'<document reference="{ref}" source="{doc.meta.get("file_name")}" '
+                                    f'section="{doc.meta.get("header")}" page="{doc.meta.get("page_number")}"{truncated}>\n'
+                                    f"{body}{tail}\n</document>"
+                                )
+                            if not blocks:
+                                result = ("This document does not contain passages matching the query. "
+                                          "Reformulate with the document's own vocabulary, or tell the "
+                                          "user the named document does not contain this information.")
+                            else:
+                                result = ("Passages from the requested document(s), grouped by authority "
+                                          "rank. Cite with the reference numbers shown.\n"
+                                          "<documents>\n" + "\n".join(blocks) + "\n</documents>")
+                            return {"documents": new_docs, "result": result}
+            connections:
+            - sender: file_filter_merger.filters
+              receiver: bm25_retriever.filters
+            - sender: file_filter_merger.filters
+              receiver: embedding_retriever.filters
+            - sender: retrieval_query.output
+              receiver: bm25_retriever.query
+            - sender: retrieval_query.output
+              receiver: query_embedder.text
+            - sender: bm25_retriever.documents
+              receiver: document_joiner.documents
+            - sender: query_embedder.embedding
+              receiver: embedding_retriever.query_embedding
+            - sender: embedding_retriever.documents
+              receiver: document_joiner.documents
+            - sender: document_joiner.documents
+              receiver: ranker.documents
+            - sender: ranker.documents
+              receiver: sentence_window_retriever.retrieved_documents
+            - sender: sentence_window_retriever.context_documents
+              receiver: window_joiner.documents
+            - sender: window_joiner.documents
+              receiver: ranker_scoring.documents
+            - sender: ranker_scoring.documents
+              receiver: meta_field_grouping_ranker.documents
+            - sender: meta_field_grouping_ranker.documents
+              receiver: result_formatter.documents
+
+      # TOOL 4 (v1.1, not included): get_file_outline(file_id) - filter_documents sorted
+      # by split_id returning header/parent_headers, for when in-file search misses.
+      # See design doc §4.4. If it must be stateless it can use deepset's native CodeTool
+      # (deepset_cloud_custom_nodes.tools.code_tool.CodeTool, @tool function in `code`),
+      # but like list_corpus_files it needs the entitlement filters, so PipelineTool.
+
+  # ---------------------------------------------------------------------------
+  # OPTIONAL [O2]: if the app persists the `messages` output verbatim and chokes on
+  # tool-call/tool-result messages, expose only the final assistant message instead:
+  #
+  # final_message:
+  #   type: haystack.components.converters.output_adapter.OutputAdapter
+  #   init_parameters:
+  #     template: '{{ [last_message] }}'
+  #     output_type: list[haystack.dataclasses.chat_message.ChatMessage]
+  # (+ connection agent.last_message -> final_message.last_message,
+  #  and outputs.messages: final_message.output)
+  # ---------------------------------------------------------------------------
+
+connections:
+- sender: attachment_converter.documents
+  receiver: attachment_metadata_stamper.documents
+- sender: attachment_metadata_stamper.documents
+  receiver: attachment_formatter.documents
+# [U3] Seeds the agent's documents state (refs 1..k for the whole turn):
+- sender: attachment_formatter.documents
+  receiver: agent.documents
+# [U3] Rendered attachments block into the user_prompt variable:
+- sender: attachment_formatter.result
+  receiver: agent.attachments
+# Draft 4: never hand deepset's replayed history to the generator unfiltered.
+- sender: history_sanitizer.messages
+  receiver: agent.messages
+
+max_runs_per_component: 100
+
+metadata: {}
+
+# CONTRACT: identical inputs/outputs to v0.x - the app does not change.
+inputs:
+  query:
+  - agent.query
+  filters:
+  - agent.filters          # [U3] state field, injected into every tool server-side
+  messages:
+  - history_sanitizer.messages   # sanitized, THEN to agent.messages (draft 4)
+  files:
+  - attachment_converter.sources
+
+outputs:
+  documents: agent.documents   # accumulated state, in citation order
+  messages: agent.messages     # see O2 above if tool messages leak to the app
+
+pipeline_output_type: chat

@@ -1,0 +1,899 @@
+# haystack-pipeline
+# ALINA - RAG pipeline DIGIT.R3
+#
+# ============================ v0.9: CHAT FILE ATTACHMENTS (DRAFT) ============================
+# Adds support for users dragging a file into the chat mid-conversation (deepset "Upload Temporary
+# File" endpoint), in addition to the pre-ingested, permanently indexed corpus.
+#
+# The chat/chat-stream request already accepts a top-level `files` field (an array of file IDs),
+# but nothing in earlier pipeline versions consumed it - see the comment in
+# src/app/api/haystack/search-stream/route.ts, which sends `files` and notes it is a no-op today.
+#
+# THIS BLOCK IS UNVERIFIED. The exact `type:` string for a file-in `Input` component, and how its
+# `files` socket is declared, is not confirmed against a real deepset Builder export - the public
+# docs describe the *behaviour* (an `Input` component exposes sockets such as `messages`, `query`,
+# and, for file-in pipelines, `files`, wired directly to downstream components) but not the literal
+# YAML. Before deploying, recreate this section in Builder (drag in a file-in `Input`, a
+# `MultiFileConverter`, and a `Code` component) and reconcile the exported YAML against the sketch
+# below, correcting component `type:` strings as needed.
+#
+# DESIGN
+#   attachment_input: platform `Input` component with a `files` output socket, populated from the
+#     request's `files` field (temporary or permanent file IDs).
+#   attachment_converter: MultiFileConverter turns the uploaded files into Documents.
+#   attachment_metadata_stamper: a small Code component that stamps each attachment Document with
+#     metadata compatible with meta_field_grouping_ranker's existing config
+#     (group_by: authority_rank, subgroup_by: file_id, sort_docs_by: split_id):
+#       - authority_rank = 0 (ranks ABOVE every corpus source, since the user explicitly attached it)
+#       - file_id = the attachment's own file ID (keeps same-file chunks grouped together)
+#       - split_id = a sequential index per attachment (grouping ranker needs it to sort)
+#       - header = "Attached file: <file_name>" (shown in the prompt's document tag and reused by
+#         the reranker's meta_fields_to_embed)
+#   attachment_joiner: DocumentJoiner (concatenate) merging the retrieval pipeline's scored/deduped
+#     context (ranker_scoring.documents) with the stamped attachment documents. Concatenate, not
+#     reciprocal_rank_fusion: attachments are not competing on relevance, they're always included
+#     because the user explicitly attached them - the existing rankers already handle relevance
+#     scoring for the retrieved corpus side.
+#   meta_field_grouping_ranker now reads from attachment_joiner instead of ranker_scoring directly.
+#
+# Attachments are converted to Documents in-memory for this run only, never written to the
+# OpenSearch index, so no document-store-level entitlement/isolation change is needed: an
+# attachment is visible only within the conversation/request that carries its file ID.
+# ==============================================================================================
+#
+# ======================= v0.8: BM25 maxClauseCount / QUERY LENGTH =======================
+# Symptom: OpenSearchBM25Retriever fails once a conversation has a few turns with
+#   RequestError(400, 'search_phase_execution_exception',
+#                 'failed to create query: maxClauseCount is set to 1024')
+#
+# ROOT CAUSE: the query string reaching the pipeline grows with conversation length,
+# because the application concatenates prior turns into `query`. OpenSearchDocumentStore
+# builds BM25 as:
+#       {"multi_match": {"query": <query>, "type": "most_fields", "operator": "OR"}}
+# with NO explicit "fields" list, so OpenSearch expands it over every searchable field via
+# index.query.default_field = "*". "most_fields" issues one match per field, and each match
+# contributes one boolean clause per query term, so:
+#       clauses ~= query_terms x searchable_fields
+# Lucene rejects the query above 1024 clauses. With the metadata now written into
+# ALINA-V0.3 (file_name, header, parent_headers, source_id, plus everything Kreuzberg adds:
+# mime_type, file_extensions, detected_languages, keywords, output_format ...) the field
+# count is roughly 10, so ~100 query terms is the practical ceiling. A few turns of ALINA
+# answers, which are long because they quote sources, blow straight past it.
+#
+# Haystack has a built-in escape hatch for exactly this: on "too_many_clauses" it retries
+# with fuzziness=0. It is explicitly skipped when fuzziness is ALREADY 0, which is our
+# setting, so the error propagates untouched. Its own log line says "Consider reducing
+# query length" - that is what this version does.
+#
+# FIX: a retrieval_query OutputAdapter caps the query at 100 words and feeds BM25, the
+# embedder and BOTH rankers. chat_prompt_builder keeps the raw query, so the LLM still sees
+# the question exactly as asked.
+#
+# THIS ALSO RELIEVES THE v0.7 OOM. The rankers are cross-encoders: the sequence they attend
+# over is query + document, so an unbounded query inflated seq_len for EVERY document in
+# EVERY batch, and attention cost is quadratic in seq_len. The two errors were the same
+# underlying problem showing up in two places, which is why both got worse as conversations
+# got longer.
+#
+# THE REAL FIX IS IN THE APPLICATION: `query` should carry the current question only.
+# History belongs in `messages`, which chat_prompt_builder already renders into
+# <conversation_history>. Right now history is being sent twice and is polluting retrieval
+# with terms from earlier, unrelated questions. This cap is a guard, not a substitute.
+#
+# OPTIONAL, NOT ENABLED - restrict BM25 to the fields that matter, via custom_query:
+#       custom_query:
+#         query:
+#           bool:
+#             must:
+#             - multi_match:
+#                 query: $query
+#                 fields: [content, meta.header, meta.file_name]
+#             filter: $filters
+# That divides the clause count by ~3 instead of ~10 AND fixes a relevance problem: BM25
+# currently matches against mime_type, detected_languages and file_extensions, which is
+# noise. !! Test filter behaviour carefully before enabling: $filters renders to None when
+# no filters are passed, and ALINA relies on filters for per-user document entitlement, so
+# a mistake here has access-control consequences, not just relevance ones.
+# =======================================================================================
+#
+# ============================ v0.7: RERANKER GPU OOM ============================
+# Symptom: DeepsetNvidiaRanker fails intermittently with
+#   onnx runtime error 6 ... Add node '/model/layers.0/self_attn/Add_2'
+#   Failed to allocate memory for requested buffer of size 2147483648
+#
+# 2147483648 is exactly 2 GiB, and the failing node is the attention score tensor of
+# layer 0, whose shape is [batch, heads, seq_len, seq_len]. Qwen3-Reranker-0.6B has 16
+# query heads, so at fp32:
+#       bytes = batch x 16 x seq_len^2 x 4
+# Solving for 2 GiB gives batch x seq_len^2 = 33,554,432, satisfied exactly by
+# batch=32/seq=1024 and by batch=8/seq=2048. So the allocation is a normal attention
+# buffer, not a leak: the model is simply being handed too much at once.
+#
+# The two levers behave very differently:
+#   - batch_size is LINEAR      40 -> 8 cuts the buffer 5x
+#   - seq_len   is QUADRATIC    1024 -> 512 cuts it 4x
+# and seq_len is set by the LONGEST document in a batch, because everything is padded
+# up to it. One oversized chunk therefore inflates the cost of its entire batch.
+#
+# CHANGES
+#   a. batch_size: 8 on both rankers (default is 40). This is the immediate fix and the
+#      only in-pipeline lever on memory: DeepsetNvidiaRanker has no truncate parameter,
+#      so document length cannot be capped here.
+#   b. bm25 and embedding top_k 50 -> 30. Fewer candidates into pass 1, so fewer batches
+#      per query and less concurrent pressure on the shared Triton ensemble. Retrieval
+#      recall is barely affected: the reranker only keeps 10.
+#   c. ranker_scoring.top_k follows from ranker.top_k, still 10 * (2*1+1) = 30, so it
+#      continues to score without trimming.
+#
+# WHY THIS STARTED "GETTING WORSE" RATHER THAN FAILING FROM DAY ONE
+#   - v0.6 introduced a SECOND reranker, so each query now makes two passes over the same
+#     shared GPU ensemble instead of one.
+#   - meta_fields_to_embed prepends header + file_name to every document, lengthening
+#     each sequence slightly.
+#   - As more files were indexed, the chance that a batch contains one oversized chunk
+#     rose. Because of padding, a single long chunk sets seq_len for its whole batch, and
+#     the cost is quadratic in it.
+# The durable fix is therefore on the INDEX side: no chunk should exceed ~512 tokens.
+# indexing v0.4 targets 250 words (~340 tokens), but any documents written into
+# ALINA-V0.3 before that fix, and any XLSX worksheet indexed without table_splitter, are
+# still oversized and will keep triggering this. Worth querying the index for maximum
+# content length and re-indexing the offenders.
+#
+# IF IT STILL RECURS
+#   - batch_size: 4 (another 2x).
+#   - Drop ranker_scoring and re-attach scores with a small custom component instead
+#     (fix B from the earlier discussion): halves reranker load per query.
+#   - Ask deepset whether the Triton instance backing the ensemble can be given more GPU
+#     memory, since it is shared infrastructure and concurrency is part of the trigger.
+# ================================================================================
+#
+# v0.6 = v0.5 plus the score fix, plus two template regressions repaired.
+#
+# 1. SCORE FIX (fix A). SentenceWindowRetriever fetches neighbours with
+#    document_store.filter_documents(), a metadata-only filter with no scoring pass, and its
+#    window spans split_id +/- window_size, which INCLUDES the anchor. So the reranked original
+#    is thrown away and replaced by an unscored copy from the store. Verified: 3 documents in
+#    with scores 4.06 / 4.06 / 2.74, 8 documents out, every one score=None. Anything downstream
+#    that coerces None renders it as 0.
+#    It also returns duplicates: context_documents.extend() runs once per anchor with no
+#    dedup, so adjacent anchors repeat chunks. Verified: 3 anchors -> 8 documents, 4 unique,
+#    one of them 3 times. With meta_field_grouping_ranker sorting by split_id, the LLM was
+#    seeing the same passage two or three times under different reference numbers: wasted
+#    context budget and false corroboration for the "quote and cite" rule.
+#    Fix: window_joiner (dedup) then ranker_scoring (real scores) between the window retriever
+#    and the grouping ranker. Config only, and context chunks now get genuinely scored against
+#    the query instead of inheriting a neighbour's number.
+#
+# 2. TEMPLATE REGRESSION - MISSING {%- else %}. In v0.5 as deployed, the else branch had been
+#    deleted, leaving a single {% endif %}. Verified by rendering: with documents present the
+#    user turn ended with "No documents were retrieved for this query. Tell the user you have
+#    no source material to answer from", directly contradicting the documents above it; and
+#    with no documents the whole block rendered EMPTY. That pushes the model to refuse on
+#    answerable questions, which is the single most damaging thing possible for the UAT pass
+#    rate. Restored below.
+#
+# 3. TEMPLATE REGRESSION - BROKEN document TAG. source=" was followed by a newline, so every
+#    rendered attribute read source="\nDPS.docx". Rejoined below.
+#
+# 4. SYSTEM PROMPT BLOCK STYLE >- -> |-. YAML folded style joins consecutive lines with
+#    spaces, so the whole prompt collapsed into one paragraph and every "# heading" and "-"
+#    bullet ended up mid-sentence. Literal style preserves the markdown structure the prompt
+#    was written in. This was wrong in every version up to v0.5.
+#
+# STILL OPEN:
+#   - authority_rank is not populated by the indexing pipeline, so meta_field_grouping_ranker
+#     and the source-hierarchy rules in the system prompt are inert.
+#   - source_id_meta_field / subgroup_by use file_id. file_id is platform-injected; source_id
+#     is what both splitters guarantee. If windowing returns unwindowed chunks, switch both.
+components:
+  retrieval_query:
+    # Bounds the query string used for RETRIEVAL only. The raw query still goes to
+    # chat_prompt_builder untouched, so the LLM always sees what the user actually asked.
+    #
+    # Keeps the LAST 100 words. Tail, not head, because when an application concatenates
+    # conversation history into the query the current question sits at the END. If your app
+    # puts the question FIRST and the history after, change [-100:] to [:100].
+    # !! Confirm what your application sends as `query` before trusting either default.
+    type: haystack.components.converters.output_adapter.OutputAdapter
+    init_parameters:
+      template: '{{ query.split()[-100:] | join('' '') }}'
+      output_type: str
+  bm25_retriever:
+    # Selects the most similar documents from the document store
+    type: haystack_integrations.components.retrievers.opensearch.bm25_retriever.OpenSearchBM25Retriever
+    init_parameters:
+      document_store:
+        type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+        init_parameters:
+          embedding_dim: 768
+          index: ALINA-V0.3
+          use_ssl: false
+      # 50 -> 30: fewer candidates into the reranker, fewer batches, less GPU pressure.
+      # The reranker keeps only 10, so recall impact is marginal.
+      top_k: 30
+      fuzziness: 0
+  query_embedder:
+    type: deepset_cloud_custom_nodes.embedders.nvidia.text_embedder.DeepsetNvidiaTextEmbedder
+    init_parameters:
+      normalize_embeddings: true
+      model: intfloat/e5-base-v2
+      # e5 models require this instruction prefix on queries ("passage: " on documents)
+      prefix: 'query: '
+      suffix: ''
+  embedding_retriever:
+    # Selects the most similar documents from the document store
+    type: haystack_integrations.components.retrievers.opensearch.embedding_retriever.OpenSearchEmbeddingRetriever
+    init_parameters:
+      document_store:
+        type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+        init_parameters:
+          embedding_dim: 768
+          index: ALINA-V0.3
+          use_ssl: false
+      # 50 -> 30: fewer candidates into the reranker, fewer batches, less GPU pressure.
+      # The reranker keeps only 10, so recall impact is marginal.
+      top_k: 30
+  document_joiner:
+    # Fuses the BM25 and embedding rankings and deduplicates shared chunks
+    type: haystack.components.joiners.document_joiner.DocumentJoiner
+    init_parameters:
+      join_mode: reciprocal_rank_fusion
+  ranker:
+    # Pass 1: picks the anchor chunks. top_k stays small to bound how many window lookups
+    # the sentence window retriever has to make.
+    type: deepset_cloud_custom_nodes.rankers.nvidia.ranker.DeepsetNvidiaRanker
+    init_parameters:
+      model: tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+      top_k: 10
+      # Default is 40. Attention memory is batch x 16 heads x seq_len^2 x 4 bytes, so this is
+      # a linear 5x cut on the buffer that was failing to allocate. Lower to 4 if it recurs.
+      batch_size: 8
+      # The reranker scores query against document TEXT only, and continuation chunks carry no
+      # header in their text. Mirror the index-side meta_fields_to_embed so the reranker sees
+      # which section a chunk belongs to, otherwise mid-section chunks are systematically
+      # under-scored against chunk 0 of the same section.
+      meta_fields_to_embed:
+      - header
+      - file_name
+      # Quoted: unquoted \n in YAML is the two characters backslash-n, not a newline
+      embedding_separator: \n
+  sentence_window_retriever:
+    # Fetches the chunk before and after each top-ranked chunk so that exceptions,
+    # derogations and adjacent subsections of the cited rule reach the LLM
+    type: haystack.components.retrievers.sentence_window_retriever.SentenceWindowRetriever
+    init_parameters:
+      document_store:
+        type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+        init_parameters:
+          embedding_dim: 768
+          index: ALINA-V0.3
+          use_ssl: false
+      window_size: 1
+      source_id_meta_field: file_id
+      split_id_meta_field: split_id
+      # Some corpus files (e.g. xlsx Q&A logs) may lack split metadata; keep the
+      # original chunk instead of failing
+      raise_on_missing_meta_fields: false
+  window_joiner:
+    # SentenceWindowRetriever emits one window per anchor with no dedup, so adjacent anchors
+    # repeat chunks. concatenate keys on document id and collapses them.
+    type: haystack.components.joiners.document_joiner.DocumentJoiner
+    init_parameters:
+      join_mode: concatenate
+  ranker_scoring:
+    # Pass 2: the window retriever strips scores (filter_documents does not score). This pass
+    # restores them and, unlike copying the anchor's score across, scores each context chunk
+    # on its own merit.
+    # top_k is deliberately set at or above the maximum this can receive
+    # (ranker.top_k * (2 * window_size + 1) = 10 * 3 = 30) so that it SCORES without TRIMMING.
+    # A context chunk is present because it is adjacent to a good match, not because it scores
+    # well alone: the chunk holding a derogation often scores poorly on its own, and trimming
+    # here would throw away exactly what the window was added to recover (GS-001, GS-006,
+    # GS-011). Trimming stays the job of the context budget in the prompt template.
+    type: deepset_cloud_custom_nodes.rankers.nvidia.ranker.DeepsetNvidiaRanker
+    init_parameters:
+      model: tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+      top_k: 30
+      # Same 5x memory cut as pass 1. This pass sees at most 30 documents, so at batch_size 8
+      # it is 4 batches; the extra round trips cost latency, not correctness.
+      batch_size: 8
+      meta_fields_to_embed:
+      - header
+      - file_name
+      embedding_separator: \n
+      # Sigmoid-scaled 0..1 scores, which is what the sources panel displays
+      scale_score: true
+      calibration_factor: 1
+  attachment_converter:
+    # Turns the user-attached files into Documents, same as at index time
+    type: haystack.components.converters.multi_file_converter.MultiFileConverter
+    init_parameters: {}
+  attachment_metadata_stamper:
+    # Stamps attachments with metadata the existing meta_field_grouping_ranker config expects
+    # (group_by: authority_rank, subgroup_by: file_id, sort_docs_by: split_id), and gives them
+    # authority_rank=0 so they group ahead of every corpus source.
+    type: deepset_cloud_custom_nodes.code.code_component.Code
+    init_parameters:
+      code: |
+        from haystack import component
+        from haystack.dataclasses import Document
+
+        @component
+        class AttachmentMetadataStamper:
+            """Stamps attachments with metadata the meta_field_grouping_ranker config expects."""
+
+            @component.output_types(documents=list[Document])
+            def run(self, documents: list[Document]):
+                for split_id, document in enumerate(documents):
+                    document.meta["authority_rank"] = 0
+                    document.meta.setdefault("file_id", document.meta.get("file_id", document.id))
+                    document.meta["split_id"] = split_id
+                    file_name = document.meta.get("file_name", "attached file")
+                    document.meta["header"] = f"Attached file: {file_name}"
+                return {"documents": documents}
+  attachment_joiner:
+    # Concatenate, not RRF: attachments are always included, not competing on relevance
+    type: haystack.components.joiners.document_joiner.DocumentJoiner
+    init_parameters:
+      join_mode: concatenate
+  meta_field_grouping_ranker:
+    # Regroups chunks coming from the same file, in their original order
+    type: haystack.components.rankers.meta_field_grouping_ranker.MetaFieldGroupingRanker
+    init_parameters:
+      group_by: authority_rank
+      subgroup_by: file_id
+      sort_docs_by: split_id
+  chat_prompt_builder:
+    # Builds the current user turn with prior conversation turns and retrieved documents
+    type: haystack.components.builders.chat_prompt_builder.ChatPromptBuilder
+    init_parameters:
+      required_variables:
+      - query
+      - documents
+      variables:
+      - query
+      - documents
+      - messages
+      template: >-
+        {% message role="user" %}
+
+        {%- if messages|length > 0 %}
+
+        Here is the conversation history. Use it to resolve references and
+
+        follow-up questions. Treat it as context, not as source material.
+
+        <conversation_history>
+
+        {% for message in messages %}
+
+        <message role="{{ message.role }}">
+
+        {{ message.content }}
+
+        </message>
+
+        {% endfor %}
+
+        </conversation_history>
+
+        {%- endif %}
+
+        Here is the user's current query:
+
+        <query>
+
+        {{ query }}
+
+        </query>
+
+        {%- if documents|length > 0 %}
+
+        Here are the documents retrieved as relevant to this query. Each is
+
+        delimited and tagged with its reference number, source name and section.
+
+        Use these tags when citing. Documents are grouped by authority rank:
+
+        earlier groups carry higher legal authority than later ones.
+
+        {%- set per_doc_chars = 12000 %}
+
+        {%- set total_chars = 240000 %}
+
+        {%- set ns = namespace(used=0, omitted=0) %}
+
+        <documents>
+
+        {% for document in documents %}
+
+        {%- set full = document.content | default('', true) %}
+
+        {%- set body = full[:per_doc_chars] %}
+
+        {%- if ns.used + (body | length) <= total_chars %}
+
+        <document reference="{{ loop.index }}" source="{{
+
+        document.meta.file_name }}" section="{{ document.meta.header }}"
+
+        page="{{ document.meta.page_number }}"{% if (full | length) > (body |
+        length) %} truncated="true"{% endif %}>
+
+        {{ body }}{% if (full | length) > (body | length) %}
+
+        [... this passage continues beyond what is shown here ...]{% endif %}
+
+        </document>
+
+        {%- set ns.used = ns.used + (body | length) %}
+
+        {%- else %}
+
+        {%- set ns.omitted = ns.omitted + 1 %}
+
+        {%- endif %}
+
+        {% endfor %}
+
+        </documents>
+
+        {%- if ns.omitted > 0 %}
+
+        Note: {{ ns.omitted }} lower-ranked passage(s) were left out to stay
+
+        within the context budget, and some passages above may be cut short.
+
+        Where a passage is marked truncated, the provision may continue beyond
+
+        the text you can see: do not treat the cut-off point as the end of the
+
+        rule, and if the answer would depend on the missing part, say so.
+
+        {%- endif %}
+
+        Before writing your answer, work through these checks:
+
+        1. Answerability: do the passages above actually contain the
+
+        information requested? Retrieval always returns documents, so their
+
+        presence alone does not mean the question is answerable. If the
+
+        requested information is not in the passages, or the question asks
+
+        about case-specific or operational data outside this document corpus,
+
+        say you cannot answer from the available documents instead of
+
+        building an answer from loosely related passages.
+
+        2. Completeness: after identifying the general rule, re-scan every
+
+        passage for exceptions, derogations, extensions, thresholds and
+
+        special cases that qualify it (wording such as "unless", "except",
+
+        "however", "may be extended", "by way of derogation"). Include every
+
+        applicable one. Distinguish what is mandatory from what is
+
+        discretionary.
+
+        3. Source selection: when several documents state the same rule,
+
+        answer from the highest-authority source and cite the exact section
+
+        that directly answers the question, not a neighbouring or broader
+
+        section.
+
+        Then answer the current query using only the documents above, taking
+
+        the conversation history into account for follow-up questions. Give
+
+        the direct answer in the first paragraph, then the supporting quotes
+
+        and detail. Quote the relevant passages verbatim and cite each one.
+
+        If the documents do not contain enough information, say so and
+
+        specify what is missing.
+
+        {%- else %}
+
+        No documents were retrieved for this query. Tell the user you have no
+
+        source material to answer from, and invite them to rephrase or narrow
+
+        the scope of the query.
+
+        {%- endif %}
+
+        {% endmessage %}
+  LLM:
+    type: haystack.components.generators.chat.llm.LLM
+    init_parameters:
+      chat_generator:
+        type: haystack.components.generators.chat.openai_responses.OpenAIResponsesChatGenerator
+        init_parameters:
+          model: gpt-5.1
+          api_key:
+            type: env_var
+            strict: true
+            env_vars:
+            - GPTEC_API_KEY
+          timeout:
+          max_retries:
+          api_base_url: https://api.tech.ec.europa.eu/ecgpt/v1
+          organization:
+          generation_kwargs:
+          http_client_kwargs:
+            # Literal block (|-) not folded (>-): folding collapses the whole prompt into a single
+            # paragraph and buries every markdown heading and bullet mid-sentence.
+      system_prompt: >-
+        {% message role="system" %}
+
+        You are ALINA, the AI assistant of the European Commission's DIGIT.R3
+        procurement
+
+        division.
+
+        # What ALINA is
+
+        ALINA is a source-grounded assistant for procurement and contract
+        intelligence, and also
+
+        the web platform through which staff interact with you. Users log in,
+        open a chat, and
+
+        ask questions in natural language; you answer from a curated corpus of
+        procurement
+
+        documents (tenders, contracts, framework agreements, technical
+        specifications, internal
+
+        guidelines, and related correspondence). You are a prototype built to
+        answer strictly
+
+        from the documents retrieved for each question.
+
+        # How the platform frames your answers
+
+        - Conversations are multi-turn. You receive the prior exchanges and the
+        new question.
+
+        Resolve follow-ups ("and for that one?", "summarise it") against the
+        earlier turns,
+
+        and keep answers consistent with what was already established.
+
+        - The interface displays your sources in a dedicated panel under each
+        answer (name,
+
+        page, short extract, relevance score), each item clickable to open and
+        highlight the
+
+        cited passage. Your citations must therefore map cleanly to real
+        retrieved documents.
+
+        - A conversation may be scoped to a specific project, and each user only
+        sees documents
+
+        they are entitled to. Answer only from the documents supplied to you.
+        Never infer,
+
+        reconstruct, or reference content from documents outside the retrieved
+        set, and never
+
+        mention documents the user has not been given access to.
+
+        - Users can add documents mid-conversation and can rate answers. Treat
+        any newly added
+
+        documents as part of the available context for subsequent turns.
+
+        - Long passages may reach you shortened, and lower-ranked passages may
+        be left out
+
+        entirely, to fit the context budget. A passage tagged truncated="true"
+        continues
+
+        beyond the text you receive. Never assume the cut-off point is the end
+        of a
+
+        provision, and never conclude that a rule has no exception on the
+        strength of a
+
+        truncated passage alone.
+
+        # Core principle: answer only from the retrieved documents
+
+        - Base every factual statement exclusively on the documents supplied in
+        the user
+
+        message. Do not use outside knowledge, assumptions, or general
+        background about EU
+
+        procurement to fill gaps. Do not add steps, obligations, or practices
+        (for example
+
+        record-keeping or logging duties) that the retrieved documents do not
+        state.
+
+        - Retrieved documents are not proof of answerability. The retriever
+        always returns the
+
+        closest matches it can find, so you will often receive documents that
+        share the
+
+        question's topic without containing its answer. Check that the passages
+        actually
+
+        answer the question before using them.
+
+        - If the retrieved documents do not contain the answer, say so
+        explicitly ("I don't
+
+        have this information in the available documents") and state what is
+        missing. Do not
+
+        guess or fabricate references, figures, dates, clauses, or article
+        numbers.
+
+        - Some questions are outside this corpus by nature: the live status of a
+        specific tender
+
+        or contract in an operational system, data about identified suppliers or
+        individuals,
+
+        figures held in financial or workflow systems, or anything requiring
+        access beyond the
+
+        document set. For these, state clearly that you cannot answer from the
+        available
+
+        documents and, where obvious, point to the responsible service or
+        system. Do not piece
+
+        together an answer from documents that merely mention the topic.
+
+        - If documents partially answer the question, answer the supported part
+        and clearly flag
+
+        what remains unanswered.
+
+        - If documents conflict, present both positions and cite each source
+        rather than
+
+        silently choosing one.
+
+        - A greeting or a remark that is not a question about the corpus does
+        not require
+
+        sources. Reply briefly and naturally, and do not comment on the
+        documents that were
+
+        retrieved.
+
+        # Completeness: rules and their exceptions
+
+        - Procurement rules almost always come with exceptions, derogations,
+        extension
+
+        possibilities, thresholds, or special cases, usually stated near the
+        main rule. After
+
+        you find the passage stating the general rule, re-read the surrounding
+        retrieved text
+
+        for qualifying language ("unless", "except", "however", "may be
+        extended", "by way of
+
+        derogation", "in duly justified cases") and include every exception that
+        applies to
+
+        the question. An answer that states the rule but omits an applicable
+        exception present
+
+        in the retrieved text is an incomplete answer.
+
+        - When the question asks whether something is possible or allowed,
+        enumerate all the
+
+        cases the documents provide, and distinguish cases where an action is
+        mandatory from
+
+        cases where it is discretionary.
+
+        # Choosing the right source and section
+
+        - The documents are supplied grouped by authority rank, from highest to
+        lowest. When
+
+        several sources state the same rule, base your answer and primary
+        citation on the
+
+        highest-ranking source: legal acts (the Financial Regulation and its
+        annexes, EU
+
+        directives) above internal rules, decisions and circulars, above
+        guidance documents
+
+        and the vademecum, above project-specific tender specifications, above
+        Q&A logs,
+
+        checklists and correspondence. Lower-ranking sources may be cited in
+        addition.
+
+        - When your answer relies on an article of a legal act (for example an
+        article of the
+
+        Financial Regulation), quote that article from the legal act itself
+        whenever the act
+
+        is among the retrieved documents. If only a secondary source mentions
+        the article,
+
+        cite the secondary source and make explicit that the article itself is
+        not in the
+
+        retrieved set.
+
+        - Cite the specific section whose text answers the question. Before
+        citing, verify the
+
+        quoted passage itself contains the answer; being in the right document
+        or on the right
+
+        topic is not enough. Never cite a whole chapter when a subsection holds
+        the answer.
+
+        # Citing and quoting
+
+        - Support every claim with a direct quotation from the source, in
+        quotation marks,
+
+        followed by the document's reference number in square brackets, e.g.
+        [3].
+
+        - Cite inline, next to the specific claim, never as a References section
+        at the end.
+
+        - Quote verbatim: quoted text must be an exact, character-for-character
+        substring of the
+
+        retrieved document. Do not paraphrase, merge, trim words inside, or
+        reconstruct text
+
+        from memory inside quotation marks. If you cannot locate the exact
+        wording in the
+
+        retrieved text, do not present it as a quote: paraphrase without
+        quotation marks and
+
+        cite, or state that the information is missing. Keep quotes short (a
+        sentence or a
+
+        clause, not whole pages).
+
+        - When you synthesise across sources, still attach the reference
+        number(s) each
+
+        statement rests on.
+
+        - Only use reference numbers that appear in the current set of
+        documents.
+
+        - Never invent a page number, section heading, or document name that is
+        not in the tags.
+
+        # Style and tone
+
+        - Professional, precise, neutral, suited to an EU institutional context.
+
+        - The first paragraph must contain the complete direct answer to the
+        question.
+
+        Supporting quotes, conditions and detail follow. A reader who stops
+        after the first
+
+        paragraph should have the correct answer.
+
+        - Be brief. Do not pad answers with background the user did not ask for,
+        restatements of
+
+        the question, or generic closing advice. When refusing or reporting
+        missing
+
+        information, do so in a few sentences.
+
+        - Preserve exact terminology, reference numbers, dates, and monetary
+        amounts as written
+
+        in the sources.
+
+        - Format responses using markdown.
+
+        - Always answer in English.
+
+        # Boundaries
+
+        - You provide information grounded in the documents. You do not give
+        legal advice, make
+
+        procurement decisions, or issue binding interpretations. Where a
+        question needs
+
+        judgement beyond the text, state what the documents say and note that
+        the decision
+
+        rests with the responsible officer.
+
+        - If a request is unrelated to the retrieved documents or outside
+        procurement scope, say
+
+        it falls outside what you can answer from the source set.
+
+        {% endmessage %}
+      streaming_callback: deepset_cloud_custom_nodes.callbacks.streaming.streaming_callback
+      user_prompt:
+
+connections:
+- sender: retrieval_query.output
+  receiver: bm25_retriever.query
+- sender: retrieval_query.output
+  receiver: query_embedder.text
+- sender: retrieval_query.output
+  receiver: ranker.query
+- sender: retrieval_query.output
+  receiver: ranker_scoring.query
+- sender: bm25_retriever.documents
+  receiver: document_joiner.documents
+- sender: query_embedder.embedding
+  receiver: embedding_retriever.query_embedding
+- sender: embedding_retriever.documents
+  receiver: document_joiner.documents
+- sender: document_joiner.documents
+  receiver: ranker.documents
+- sender: ranker.documents
+  receiver: sentence_window_retriever.retrieved_documents
+- sender: sentence_window_retriever.context_documents
+  receiver: window_joiner.documents
+- sender: window_joiner.documents
+  receiver: ranker_scoring.documents
+- sender: ranker_scoring.documents
+  receiver: attachment_joiner.documents
+- sender: attachment_converter.documents
+  receiver: attachment_metadata_stamper.documents
+- sender: attachment_metadata_stamper.documents
+  receiver: attachment_joiner.documents
+- sender: attachment_joiner.documents
+  receiver: meta_field_grouping_ranker.documents
+- sender: meta_field_grouping_ranker.documents
+  receiver: chat_prompt_builder.documents
+- sender: chat_prompt_builder.prompt
+  receiver: LLM.messages
+
+max_runs_per_component: 100
+
+metadata: {}
+
+inputs:
+  query:
+  - retrieval_query.query
+  - chat_prompt_builder.query
+  filters:
+  - bm25_retriever.filters
+  - embedding_retriever.filters
+  messages:
+  - chat_prompt_builder.messages
+  files:
+  - attachment_converter.sources
+
+outputs:
+  documents: meta_field_grouping_ranker.documents
+  messages: LLM.messages
+
+pipeline_output_type: chat
+

@@ -1,0 +1,23 @@
+# Ne jamais envoyer ces fichiers dans le contexte de build Docker.
+# Objectif : build plus rapide + éviter de copier des secrets/artefacts.
+
+node_modules
+.next
+.git
+.gitlab-ci.yml
+Dockerfile
+.dockerignore
+
+# Secrets : NE JAMAIS les embarquer dans l'image (ils passent par
+# AWS Secrets Manager au runtime, cf. guide de déploiement).
+.env
+.env.*
+
+# Divers
+.vscode
+.DS_Store
+npm-debug.log*
+.pnpm-debug.log*
+coverage
+docs
+README.md

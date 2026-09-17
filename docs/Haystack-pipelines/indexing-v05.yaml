@@ -1,0 +1,549 @@
+# haystack-pipeline
+# ALINA - INDEXING pipeline DIGIT.R3
+# v0.5 - structural metadata. Rebased on v0.4; every v0.4 fix is kept. Changes by impact:
+#
+#  1. THE HEADER PROBLEM. Docling does not emit article headings as markdown headings, so
+#     MarkdownHeaderSplitter finds no heading between the top of the Financial Regulation
+#     and page 42+, and every chunk inherits ONE header - the whole title block plus the
+#     opening recitals. Verified against the source PDF: an article is laid out as
+#         Article 11                     (italic, centred, own line)
+#         Commitment of appropriations   (bold, centred, own line)
+#         1.  The appropriations entered in the budget may be committed ...
+#     Visually unmistakable, structurally invisible: Docling renders it as ordinary
+#     paragraphs, so there is no "#" for the splitter to cut on.
+#     Fix: `structure_promoter`, a Code component that rewrites those lines into real
+#     markdown headings BEFORE splitting. The splitter then does its job, `header` and
+#     `parent_headers` become the legal hierarchy, and chunk boundaries fall on article
+#     boundaries instead of arbitrary 250-word cuts.
+#
+#  2. HEADER FORMAT. `metadata_finalizer` composes the requested
+#         header = "<file_name> | <section title>"
+#     e.g. "Financial Regulation (2024).pdf | Article 11 - Commitment of appropriations",
+#     capped in length so a mis-detection can never again produce a multi-page blob.
+#     It also writes `section_title`, `section_path` and `article_number` as their own
+#     fields - `article_number` makes "what does Article 29 say" answerable by a metadata
+#     filter, which is the cheapest possible win for the agent's search_in_file tool.
+#
+#  3. SILENT REGRESSION IN v0.4 - the page fix is being undone by the cleaner added in the
+#     same version. DocumentCleaner.remove_extra_whitespaces runs `re.sub(r"\s\s+", " ")`,
+#     and the form feed IS a whitespace character, so Docling's "\n\f\n" collapses to " "
+#     before MarkdownHeaderSplitter ever counts it. page_number therefore stays 1
+#     everywhere, exactly the symptom v0.4 note 3 set out to fix.
+#     Fix: `structure_promoter` swaps "\f" for a non-whitespace sentinel (U+240C) that the
+#     cleaner cannot touch; the splitter counts the sentinel instead; `metadata_finalizer`
+#     strips it from the text at the end. VERIFY THIS FIRST after re-indexing: it is the
+#     difference between a usable and a useless sources panel.
+#
+#  4. INDEX NAME MISMATCH. The writer targets ALINA-V0.2 while the query pipeline reads
+#     ALINA-V0.3, so this pipeline has been writing into an index nothing queries. Set to
+#     ALINA-V0.4 below: these metadata changes require a full re-index anyway, and a new
+#     name keeps the old index queryable until the new one is validated. THE QUERY PIPELINE
+#     MUST BE BUMPED IN THE SAME DEPLOYMENT - four places in v1-agent.yaml (bm25_retriever,
+#     embedding_retriever, sentence_window_retriever, corpus_scan) plus both copies inside
+#     the search tools.
+#
+#  5. AUTHORITY RANK is now populated (docs/authority-metadata.json, 505 files) - the v0.4
+#     note saying otherwise is stale, and so was its scale. The real one is:
+#         1  treaties_and_charter                                    (2 files)
+#         2  eu_regulations, cjeu_caselaw, ec/council_directives,
+#            ec_decisions, international_agreements                  (326 files)
+#         3  budg_vademecum, general_guidance, ec_communications,
+#            ec_recommendations, contractual_documents               (39 files)
+#         4  internal_guidance, questions_and_answers                (123 files)
+#     Note the Financial Regulation is rank 2, NOT rank 1 - the query pipeline's system
+#     prompt describes a different hierarchy and should be reworded to match this file.
+#     15 files carry authority_rank: null (5 with no category, 2 procurement_documents,
+#     8 templates). meta_field_grouping_ranker groups on this field, so those files form a
+#     stray null group. Give them a rank before re-indexing.
+#
+#  6. XLSX Q&A logs: document_per left at the default (sheet). For the Q&A workbooks, one
+#     question per row is the natural retrieval unit; table_splitter mitigates the size
+#     problem but not the semantic one. Worth a per-file decision, not a global flip.
+#
+# RE-INDEXING IS MANDATORY for this version: every change here is a change to the metadata
+# written at index time, and none of it applies retroactively.
+
+components:
+  file_classifier:
+    type: haystack.components.routers.file_type_router.FileTypeRouter
+    init_parameters:
+      mime_types:
+      - text/plain
+      - application/pdf
+      - text/markdown
+      - text/html
+      - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+      - application/vnd.openxmlformats-officedocument.presentationml.presentation
+      - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+      - text/csv
+      - application/msword
+      - application/vnd.oasis.opendocument.text
+      # One unsupported file no longer aborts the whole indexing run
+      raise_on_failure: false
+
+  text_converter:
+    type: haystack.components.converters.txt.TextFileToDocument
+    init_parameters:
+      encoding: utf-8
+
+  markdown_converter:
+    type: haystack.components.converters.txt.TextFileToDocument
+    init_parameters:
+      encoding: utf-8
+
+  html_converter:
+    type: haystack.components.converters.html.HTMLToDocument
+    init_parameters:
+      extraction_kwargs:
+        output_format: markdown
+        target_language:
+        include_tables: true
+        include_links: true
+
+  pptx_converter:
+    type: haystack.components.converters.pptx.PPTXToDocument
+    init_parameters: {}
+
+  xlsx_converter:
+    type: haystack.components.converters.xlsx.XLSXToDocument
+    init_parameters:
+      # See header note 6: document_per: row is probably right for the Q&A workbooks.
+      sheet_name:
+
+  csv_converter:
+    type: haystack.components.converters.csv.CSVToDocument
+    init_parameters:
+      encoding: utf-8
+
+  ECDoclingConverter_PDF:
+    type: dc_custom_component.components.converters.docling_converter.ECDoclingConverter
+    init_parameters:
+      # Scanned pages are real in the PDF corpus, so OCR stays on here
+      do_ocr: true
+      do_table_structure: true
+      do_code_enrichment: false
+      do_formula_enrichment: false
+      do_picture_classification: false
+      do_picture_description: false
+      page_break_placeholder: "\f"
+      filter_binary_hash: true
+      pipeline_options:
+      convert_kwargs:
+      md_export_kwargs:
+
+  ECDoclingConverter_DOCX:
+    type: dc_custom_component.components.converters.docling_converter.ECDoclingConverter
+    init_parameters:
+      # Native text format: OCR only costs indexing time
+      do_ocr: false
+      do_table_structure: true
+      do_code_enrichment: false
+      do_formula_enrichment: false
+      do_picture_classification: false
+      do_picture_description: false
+      page_break_placeholder: "\f"
+      filter_binary_hash: true
+      pipeline_options:
+      convert_kwargs:
+      md_export_kwargs:
+
+  KreuzbergConverter_ODT:
+    type: haystack_integrations.components.converters.kreuzberg.converter.KreuzbergConverter
+    init_parameters:
+      # MUST be a JSON string: KreuzbergConverter.from_dict writes it to a temp .json file
+      # and calls ExtractionConfig.from_file(). A YAML mapping here is silently ignored and
+      # you fall back to plain text, which collapses each file into a single unsplit chunk.
+      config: '{"output_format": "markdown"}'
+      config_path:
+      store_full_path: false
+      batch: true
+      easyocr_kwargs:
+
+  KreuzbergConverter_DOC:
+    type: haystack_integrations.components.converters.kreuzberg.converter.KreuzbergConverter
+    init_parameters:
+      config: '{"output_format": "markdown"}'
+      config_path:
+      store_full_path: false
+      batch: true
+      easyocr_kwargs:
+
+  structure_promoter:
+    # ============================ NEW IN v0.5 - THE KEY COMPONENT ============================
+    # Runs BEFORE the cleaner and the splitter, on every markdown-structured document.
+    # Two jobs, both of which must happen at this exact point in the chain:
+    #
+    #   a. PROTECT PAGE BREAKS. Swap "\f" for U+240C (SYMBOL FOR FORM FEED), a printable,
+    #      non-whitespace character the DocumentCleaner cannot collapse. See header note 3.
+    #
+    #   b. PROMOTE LEGAL STRUCTURE TO MARKDOWN HEADINGS, so MarkdownHeaderSplitter has
+    #      something to cut on. Mapping chosen to match header_split_levels [1,2,3,4]:
+    #          TITLE / PART / ANNEX  -> #
+    #          CHAPTER               -> ##
+    #          Section               -> ###
+    #          Article N             -> #### Article N - <title from the next line>
+    #
+    # SAFETY RULES, because a false positive here fragments a document into nonsense:
+    #   - a line is only ever promoted if the ENTIRE line matches (anchored ^...$), so
+    #     "in accordance with Article 214" inside a sentence is never touched;
+    #   - lines that are already markdown headings are left exactly as they are, which is
+    #     what keeps DOCX/ODT (real headings, via Kreuzberg markdown) working unchanged;
+    #   - the article title is taken from the next non-empty line only if it looks like a
+    #     title: short, and not the start of a numbered paragraph or a lettered point.
+    # A file with no legal structure passes through untouched apart from the page sentinel.
+    # ========================================================================================
+    type: deepset_cloud_custom_nodes.code.code_component.Code
+    init_parameters:
+      code: |
+        import re
+
+        from haystack import component
+        from haystack.dataclasses import Document
+
+        PAGE_SENTINEL = "␌"  # printable, non-whitespace: survives DocumentCleaner
+
+        # Anchored whole-line patterns. Leading markdown decoration (#, *, _) is tolerated
+        # because Docling sometimes bolds or italicises these lines.
+        DECOR = r"[#*_\s]*"
+        ROMAN = r"[IVXLCDM]+"
+
+        PATTERNS = [
+            # (level, compiled pattern, label group count)
+            (1, re.compile(rf"^{DECOR}(PART\s+(?:{ROMAN}|\d+)\b.*?){DECOR}$", re.IGNORECASE)),
+            (1, re.compile(rf"^{DECOR}(TITLE\s+(?:{ROMAN}|\d+)\b.*?){DECOR}$", re.IGNORECASE)),
+            (1, re.compile(rf"^{DECOR}(ANNEX(?:E)?\s+(?:{ROMAN}|\d+)?\b.*?){DECOR}$", re.IGNORECASE)),
+            (2, re.compile(rf"^{DECOR}(CHAPTER\s+(?:{ROMAN}|\d+)\b.*?){DECOR}$", re.IGNORECASE)),
+            (3, re.compile(rf"^{DECOR}(SECTION\s+(?:{ROMAN}|\d+)\b.*?){DECOR}$", re.IGNORECASE)),
+        ]
+
+        # "Article 11", "Article 11a", "Article 11 a" - alone on its line.
+        ARTICLE = re.compile(rf"^{DECOR}Article\s+(\d+\s*[a-z]?){DECOR}$", re.IGNORECASE)
+
+        # A line that starts a numbered paragraph or a lettered point is body text, never a
+        # title: "1.  The appropriations...", "(a) routine administrative expenditure...".
+        BODY_START = re.compile(r"^\s*(?:\(?[a-z0-9]{1,4}\)|\d+\.)\s")
+
+        MAX_TITLE_CHARS = 200
+
+        def _is_heading(line: str) -> bool:
+            return line.lstrip().startswith("#")
+
+        def _clean(text: str) -> str:
+            return re.sub(r"[#*_]+", "", text).strip(" .:-–—")
+
+        @component
+        class StructurePromoter:
+            """Turns EU legal-act structure into markdown headings, and shields page breaks."""
+
+            @component.output_types(documents=list[Document])
+            def run(self, documents: list[Document]):
+                out = []
+                for doc in documents:
+                    text = (doc.content or "").replace("\f", PAGE_SENTINEL)
+                    lines = text.split("\n")
+                    result = []
+                    # Indices of title lines already folded into an article heading.
+                    # An index set, NOT a "skip next" flag: the title is usually separated
+                    # from "Article N" by a blank line, so a flag skips the blank line and
+                    # leaves the title duplicated under its own heading. Caught in testing.
+                    consumed: set[int] = set()
+
+                    for i, raw in enumerate(lines):
+                        if i in consumed:
+                            continue
+
+                        line = raw.replace(PAGE_SENTINEL, "").strip()
+
+                        # Never rewrite something that is already a heading.
+                        if not line or _is_heading(raw):
+                            result.append(raw)
+                            continue
+
+                        match = ARTICLE.match(line)
+                        if match:
+                            number = re.sub(r"\s+", "", match.group(1))
+                            title = ""
+                            # Look ahead for the article's own title line, skipping blanks.
+                            # Only the FIRST non-empty line is considered: if it is body
+                            # text the article simply gets no title, never a paragraph.
+                            for offset, candidate in enumerate(lines[i + 1:i + 4], start=i + 1):
+                                stripped = candidate.replace(PAGE_SENTINEL, "").strip()
+                                if not stripped:
+                                    continue
+                                if (not BODY_START.match(stripped)
+                                        and not _is_heading(candidate)
+                                        and len(stripped) <= MAX_TITLE_CHARS
+                                        and not ARTICLE.match(stripped)):
+                                    title = _clean(stripped)
+                                    consumed.add(offset)
+                                break
+                            heading = f"Article {number}" + (f" - {title}" if title else "")
+                            result.append(f"#### {heading}")
+                            continue
+
+                        promoted = False
+                        for level, pattern in PATTERNS:
+                            found = pattern.match(line)
+                            if found:
+                                result.append(f"{'#' * level} {_clean(found.group(1))}")
+                                promoted = True
+                                break
+                        if not promoted:
+                            result.append(raw)
+
+                    doc.content = "\n".join(result)
+                    out.append(doc)
+                return {"documents": out}
+
+  document_cleaner:
+    # Removes repeated PDF headers/footers ("EN | OJ L, 26.9.2024", "40/239 | ELI: ...")
+    # and whitespace noise before splitting. Safe to keep remove_extra_whitespaces on now
+    # that structure_promoter has replaced form feeds with a non-whitespace sentinel.
+    type: haystack.components.preprocessors.document_cleaner.DocumentCleaner
+    init_parameters:
+      remove_empty_lines: true
+      remove_extra_whitespaces: true
+      remove_repeated_substrings: true
+      keep_id: false
+
+  MarkdownHeaderSplitter:
+    type: haystack.components.preprocessors.markdown_header_splitter.MarkdownHeaderSplitter
+    init_parameters:
+      # v0.5: counts the sentinel structure_promoter substituted for "\f", which the
+      # cleaner would otherwise have swallowed. Must match PAGE_SENTINEL exactly.
+      page_break_character: "␌"
+      keep_headers: true
+      header_split_levels:
+      - 1
+      - 2
+      - 3
+      - 4
+      # "word" units, not "passage": see v0.4 note 1
+      secondary_split: word
+      split_length: 250
+      split_overlap: 50
+      # Merge fragments below this size instead of emitting header-only chunks, which are
+      # retrieval noise and give the reranker something empty to latch onto
+      split_threshold: 30
+      skip_empty_documents: true
+
+  splitter:
+    # Plain-text and PPTX path (no markdown headers available)
+    type: haystack.components.preprocessors.document_splitter.DocumentSplitter
+    init_parameters:
+      split_by: word
+      split_length: 250
+      split_overlap: 50
+      split_threshold: 30
+      respect_sentence_boundary: true
+      language: en
+
+  table_splitter:
+    # XLSX/CSV path: split by line so spreadsheet rows stay intact and no worksheet
+    # reaches the embedder as one oversized document
+    type: haystack.components.preprocessors.document_splitter.DocumentSplitter
+    init_parameters:
+      split_by: line
+      split_length: 40
+      split_overlap: 4
+      split_threshold: 5
+
+  split_joiner:
+    # Merges the three splitting paths so metadata_finalizer sees every document exactly
+    # once. Explicit joiner rather than fanning three senders into one socket.
+    type: haystack.components.joiners.document_joiner.DocumentJoiner
+    init_parameters:
+      join_mode: concatenate
+
+  metadata_finalizer:
+    # ============================ NEW IN v0.5 ============================
+    # Last stop before embedding. Everything the query side reads about a chunk's identity
+    # is decided here.
+    #
+    #   header        "<file_name> | <section title>", the requested format. The query
+    #                 pipeline puts this in the prompt's section="..." attribute and in the
+    #                 rerankers' meta_fields_to_embed, so it is doing double duty as the
+    #                 human label and as embedded context - hence file name AND section.
+    #                 NOTE: with the file name now inside header, `file_name` becomes
+    #                 redundant in the rerankers' meta_fields_to_embed. Drop it there.
+    #   section_title deepest heading alone ("Article 11 - Commitment of appropriations")
+    #   section_path  full hierarchy ("TITLE II > CHAPTER 1 > Article 11 - ...")
+    #   article_number "11" when the chunk sits under an article. Makes "what does Article
+    #                 29 say" a metadata filter instead of a semantic gamble.
+    #
+    # Also: strips the page sentinel out of the text, and caps header length so a future
+    # mis-detection degrades to a truncated label instead of a multi-page blob.
+    # ====================================================================
+    type: deepset_cloud_custom_nodes.code.code_component.Code
+    init_parameters:
+      code: |
+        import re
+
+        from haystack import component
+        from haystack.dataclasses import Document
+
+        PAGE_SENTINEL = "␌"
+        MAX_HEADER_CHARS = 180
+        MAX_SECTION_CHARS = 140
+        ARTICLE_NUM = re.compile(r"^Article\s+(\d+\s*[a-z]?)\b", re.IGNORECASE)
+
+        def _tidy(value: str) -> str:
+            value = re.sub(r"[#*_]+", " ", value or "")
+            return re.sub(r"\s+", " ", value).strip(" |-–—")
+
+        @component
+        class MetadataFinalizer:
+            """Composes the display/embedding header and the structural metadata fields."""
+
+            @component.output_types(documents=list[Document])
+            def run(self, documents: list[Document]):
+                for doc in documents:
+                    if doc.content:
+                        doc.content = doc.content.replace(PAGE_SENTINEL, "")
+
+                    meta = doc.meta
+                    file_name = (
+                        meta.get("file_name")
+                        or meta.get("dl_meta_origin_filename")
+                        or "unknown file"
+                    )
+                    meta["file_name"] = file_name
+
+                    section = _tidy(meta.get("header", ""))[:MAX_SECTION_CHARS]
+
+                    parents = meta.get("parent_headers") or []
+                    if isinstance(parents, str):
+                        parents = [parents]
+                    path_parts = [_tidy(p) for p in parents if _tidy(p)]
+                    if section:
+                        path_parts.append(section)
+                    section_path = " > ".join(path_parts)
+
+                    meta["section_title"] = section
+                    meta["section_path"] = section_path[:MAX_HEADER_CHARS]
+
+                    article = ARTICLE_NUM.match(section)
+                    if not article:
+                        for part in reversed(path_parts):
+                            article = ARTICLE_NUM.match(part)
+                            if article:
+                                break
+                    meta["article_number"] = (
+                        re.sub(r"\s+", "", article.group(1)) if article else None
+                    )
+
+                    header = f"{file_name} | {section}" if section else file_name
+                    meta["header"] = header[:MAX_HEADER_CHARS]
+
+                    meta.setdefault("page_number", None)
+                    if meta.get("authority_rank") is None:
+                        # Never leave the grouping field null: the query pipeline's
+                        # meta_field_grouping_ranker would build a stray null group that
+                        # sorts unpredictably against the real ranks. 5 = below everything
+                        # in authority-metadata.json, i.e. "unranked, lowest authority".
+                        meta["authority_rank"] = 5
+                return {"documents": documents}
+
+  document_embedder:
+    type: deepset_cloud_custom_nodes.embedders.nvidia.document_embedder.DeepsetNvidiaDocumentEmbedder
+    init_parameters:
+      normalize_embeddings: true
+      model: intfloat/e5-base-v2
+      # e5 models require this instruction prefix on documents ("query: " on queries)
+      prefix: 'passage: '
+      suffix: ''
+      # Prepends the section label to the text that gets embedded, so a mid-article chunk
+      # carries its article identity into its own vector instead of relying on chunk 0.
+      # This is the index-side counterpart of the rerankers' meta_fields_to_embed.
+      meta_fields_to_embed:
+      - header
+      embedding_separator: "\n"
+
+  writer:
+    type: haystack.components.writers.document_writer.DocumentWriter
+    init_parameters:
+      document_store:
+        type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
+        init_parameters:
+          embedding_dim: 768
+          # v0.5: was ALINA-V0.2 while the query pipeline read ALINA-V0.3 - this pipeline
+          # was writing to an index nothing queried. New name because the metadata changes
+          # need a full re-index and the old index must stay queryable until this one is
+          # validated. BUMP THE QUERY PIPELINE IN THE SAME DEPLOYMENT.
+          index: ALINA-V0.4
+      policy: OVERWRITE
+
+connections:
+# --- routing ---
+- sender: file_classifier.text/plain
+  receiver: text_converter.sources
+- sender: file_classifier.text/markdown
+  receiver: markdown_converter.sources
+- sender: file_classifier.text/html
+  receiver: html_converter.sources
+- sender: file_classifier.application/vnd.openxmlformats-officedocument.presentationml.presentation
+  receiver: pptx_converter.sources
+- sender: file_classifier.application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+  receiver: xlsx_converter.sources
+- sender: file_classifier.text/csv
+  receiver: csv_converter.sources
+- sender: file_classifier.application/pdf
+  receiver: ECDoclingConverter_PDF.sources
+- sender: file_classifier.application/vnd.openxmlformats-officedocument.wordprocessingml.document
+  receiver: ECDoclingConverter_DOCX.sources
+- sender: file_classifier.application/msword
+  receiver: KreuzbergConverter_DOC.sources
+- sender: file_classifier.application/vnd.oasis.opendocument.text
+  receiver: KreuzbergConverter_ODT.sources
+
+# --- markdown-structured path: converters -> promoter -> cleaner -> header splitter ---
+- sender: markdown_converter.documents
+  receiver: structure_promoter.documents
+- sender: html_converter.documents
+  receiver: structure_promoter.documents
+- sender: ECDoclingConverter_PDF.documents
+  receiver: structure_promoter.documents
+- sender: ECDoclingConverter_DOCX.documents
+  receiver: structure_promoter.documents
+- sender: KreuzbergConverter_DOC.documents
+  receiver: structure_promoter.documents
+- sender: KreuzbergConverter_ODT.documents
+  receiver: structure_promoter.documents
+- sender: structure_promoter.documents
+  receiver: document_cleaner.documents
+- sender: document_cleaner.documents
+  receiver: MarkdownHeaderSplitter.documents
+- sender: MarkdownHeaderSplitter.documents
+  receiver: split_joiner.documents
+
+# --- plain text / pptx path ---
+- sender: text_converter.documents
+  receiver: splitter.documents
+- sender: pptx_converter.documents
+  receiver: splitter.documents
+- sender: splitter.documents
+  receiver: split_joiner.documents
+
+# --- tabular path ---
+- sender: xlsx_converter.documents
+  receiver: table_splitter.documents
+- sender: csv_converter.documents
+  receiver: table_splitter.documents
+- sender: table_splitter.documents
+  receiver: split_joiner.documents
+
+# --- finalize + write ---
+- sender: split_joiner.documents
+  receiver: metadata_finalizer.documents
+- sender: metadata_finalizer.documents
+  receiver: document_embedder.documents
+- sender: document_embedder.documents
+  receiver: writer.documents
+
+inputs:
+  files:
+  - file_classifier.sources
+
+max_runs_per_component: 100
+
+metadata: {}
