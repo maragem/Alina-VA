@@ -1,10 +1,11 @@
 import { Button } from "@/components/ui/button";
-import { LogOut } from "lucide-react";
+import { KeyRound, LogOut } from "lucide-react";
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import type { ReactNode } from "react";
-import { auth, signOut } from "@/auth";
+import { signOut } from "@/auth";
 import { UserAvatar } from "@/components/UserAvatar";
-import { getCognitoLogoutUrl } from "@/lib/cognitoLogout";
+import { getCurrentUser } from "@/lib/currentUser";
 
 type AppShellProps = {
   activeTab: "global" | "projects" | "documents" | "admin";
@@ -17,8 +18,11 @@ export async function AppShell({
   children,
   footerDetail,
 }: AppShellProps) {
-  const session = await auth();
-  const userLabel = session?.user?.name ?? session?.user?.email;
+  const user = await getCurrentUser();
+  // The proxy only checks the cookie; a disabled account or a stale session lands here.
+  if (!user) redirect("/login");
+  if (user.mustChangePassword) redirect("/account/password");
+  const userLabel = user.displayName || user.email || "ALINA user";
 
   return (
     <div className="h-full flex flex-col overflow-hidden bg-(--ec-surface) text-(--ec-ink)">
@@ -43,23 +47,23 @@ export async function AppShell({
               </span>
             </h1>
             <div className="flex items-center gap-2">
-              {session?.user ? (
-                <>
-                  <UserAvatar
-                    name={session.user.name}
-                    email={session.user.email}
-                    title={userLabel ?? "ALINA user"}
-                    ariaLabel={
-                      userLabel
-                        ? `Signed in as ${userLabel}`
-                        : "Signed in user"
-                    }
-                  />
-                  <span className="hidden max-w-48 truncate text-xs text-(--ec-blue-100) md:inline">
-                    {userLabel}
-                  </span>
-                </>
-              ) : null}
+              <UserAvatar
+                name={user.displayName}
+                email={user.email}
+                title={userLabel}
+                ariaLabel={`Signed in as ${userLabel}`}
+              />
+              <span className="hidden max-w-48 truncate text-xs text-(--ec-blue-100) md:inline">
+                {userLabel}
+              </span>
+              <Link
+                href="/account/password"
+                className="hidden items-center gap-1 rounded-sm px-2 py-1 text-xs text-(--ec-blue-100) hover:bg-(--ec-blue-soft) hover:text-white md:inline-flex"
+                title="Change password"
+              >
+                <KeyRound aria-hidden className="size-3.5" />
+                Password
+              </Link>
             </div>
           </div>
 
@@ -88,7 +92,7 @@ export async function AppShell({
             >
               Documents
             </Link>
-            {process.env.NODE_ENV === "development" ? (
+            {user.role === "admin" ? (
               <Link
                 className={`ec-nav-tab ${activeTab === "admin" ? "active" : "inactive"}`}
                 href="/admin"
@@ -98,30 +102,24 @@ export async function AppShell({
               </Link>
             ) : null}
 
-            {session?.user ? (
-              <form
-                action={async () => {
-                  "use server";
-                  await signOut({
-                    redirectTo:
-                      getCognitoLogoutUrl() ??
-                      "/login?error=logout_configuration",
-                  });
-                }}
-                className="ml-auto"
+            <form
+              action={async () => {
+                "use server";
+                await signOut({ redirectTo: "/login" });
+              }}
+              className="ml-auto"
+            >
+              <Button
+                aria-label="Sign out"
+                className="h-9 border-transparent bg-transparent px-3 text-sm text-(--ec-blue-100) hover:bg-(--ec-blue-soft) hover:text-white"
+                type="submit"
+                variant="ghost"
+                title="Sign out"
               >
-                <Button
-                  aria-label="Sign out"
-                  className="h-9 border-transparent bg-transparent px-3 text-sm text-(--ec-blue-100) hover:bg-(--ec-blue-soft) hover:text-white"
-                  type="submit"
-                  variant="ghost"
-                  title="Sign out"
-                >
-                  <LogOut aria-hidden className="mr-2 size-4" />
-                  Sign out
-                </Button>
-              </form>
-            ) : null}
+                <LogOut aria-hidden className="mr-2 size-4" />
+                Sign out
+              </Button>
+            </form>
           </nav>
         </div>
       </header>

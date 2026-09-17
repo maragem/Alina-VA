@@ -1,3 +1,5 @@
+> **Superseded (September 2026):** authentication no longer uses Amazon Cognito. Accounts, passwords and roles are managed inside ALINA (PostgreSQL `users` table, Auth.js Credentials provider). Skip every Cognito step and the `AUTH_COGNITO_*` / `AUTH_POST_LOGOUT_URL` variables below; see the README section "Authentication and User Management".
+
 # Diagram A — Deployment / Infrastructure View
 
 > Trust boundaries: **OCTO AWS tenant** (application), **DIGIT.B1 AI@EC / Haystack SaaS tenant** (retrieval), **GPT@EC** (LLM gateway). Region is operator-chosen and not hardcoded (TBC).

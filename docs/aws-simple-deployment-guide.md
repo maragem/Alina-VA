@@ -1,3 +1,5 @@
+> **Superseded (September 2026):** authentication no longer uses Amazon Cognito. Accounts, passwords and roles are managed inside ALINA (PostgreSQL `users` table, Auth.js Credentials provider). Skip every Cognito step and the `AUTH_COGNITO_*` / `AUTH_POST_LOGOUT_URL` variables below; see the README section "Authentication and User Management".
+
 # Simple AWS Deployment Guide
 
 This guide explains the simplest practical way to deploy ALINA on a new AWS

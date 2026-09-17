@@ -4,7 +4,7 @@ import {
   getHaystackPipeline,
   getHaystackWorkspace,
 } from "@/lib/haystackConfig";
-import { requireUserId } from "@/lib/requireAuth";
+import { requireAdminUser } from "@/lib/currentUser";
 import { createHaystackSearchSession } from "@/lib/haystackSearchSessions";
 
 const API_KEY = getHaystackApiKey();
@@ -12,8 +12,8 @@ const WORKSPACE = getHaystackWorkspace();
 const PIPELINE = getHaystackPipeline();
 
 export async function POST(request: NextRequest): Promise<Response> {
-  const userId = await requireUserId();
-  if (userId instanceof Response) return userId;
+  const user = await requireAdminUser();
+  if (user instanceof Response) return user;
 
   if (process.env.NODE_ENV !== "development") {
     return Response.json({ error: "Not found." }, { status: 404 });

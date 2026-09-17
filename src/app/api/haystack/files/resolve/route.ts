@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 import { getNumber, getRecord, getText } from "@/lib/apiParsing";
 import { getHaystackApiKey, getHaystackWorkspace } from "@/lib/haystackConfig";
-import { requireUserId } from "@/lib/requireAuth";
+import { requireAppUser } from "@/lib/currentUser";
 
 const API_KEY = getHaystackApiKey();
 const WORKSPACE = getHaystackWorkspace();
@@ -9,8 +9,8 @@ const FILE_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export async function GET(request: NextRequest): Promise<Response> {
-  const userId = await requireUserId();
-  if (userId instanceof Response) return userId;
+  const user = await requireAppUser();
+  if (user instanceof Response) return user;
 
   if (!API_KEY) {
     return Response.json(

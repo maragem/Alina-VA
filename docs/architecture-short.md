@@ -11,12 +11,11 @@ flowchart LR
         subgraph NJS["Next.js runtime"]
           UI[App Router pages<br/>TSX React components]
           API[Server routes<br/>/api/* in TypeScript]
-          AUTH[Auth.js + Cognito integration]
+          AUTH[Auth.js credentials login<br/>users + password hashes in PostgreSQL]
           DBR[Drizzle ORM repositories]
         end
       end
 
-      C[AWS Cognito<br/>Managed Login]
       RDS[(AWS RDS<br/>PostgreSQL)]
     end
 
@@ -25,8 +24,8 @@ flowchart LR
     API --> AUTH
     API --> DBR
     DBR --> RDS
+    AUTH --> DBR
     API --> H[deepset/Haystack APIs\nsearch stream + document CRUD + files + feedback]
-    AUTH --> C
 
     UI --> API
 
@@ -37,13 +36,17 @@ flowchart LR
 
   ## 2) AWS Resources (Scope)
 
-  Only these three AWS resources are used by this architecture:
+  Only these two AWS resources are used by this architecture:
 
-  - Cognito: user authentication (Managed Login).
   - ECS: runs the ALINA Docker container (Next.js UI + server/API runtime).
-  - RDS: managed PostgreSQL database for persisted application data.
+  - RDS: managed PostgreSQL database for persisted application data,
+    including user accounts and password hashes.
 
-  No other AWS runtime resource is part of this architecture note.
+  No other AWS runtime resource is part of this architecture note. Amazon
+  Cognito was used for authentication until September 2026 and has been
+  replaced by application-managed accounts (see README, "Authentication and
+  User Management"). The same container and database can also run on Railway
+  (see `docs/railway-deployment-guide.md`).
 
   ## 3) Programming Languages
 
@@ -56,7 +59,7 @@ flowchart LR
 
 - Browser/UI: renders chat and document-management interfaces.
 - Next.js server: hosts pages and API routes, keeps secrets server-side, proxies requests to Haystack APIs.
-- Cognito/Auth.js: authentication and session management.
+- Auth.js with a Credentials provider: sign-in against the `users` table (scrypt password hashes), JWT session cookie, account lockout and disable handled in the application.
 - RDS PostgreSQL: conversation/project persistence.
 - Haystack/deepset Cloud: retrieval pipeline and document/file operations.
 

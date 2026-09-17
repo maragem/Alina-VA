@@ -47,48 +47,46 @@ repository ships a `railway.toml` that selects the Dockerfile builder, runs
 the migrations as a pre-deploy command, and points the health check at
 `/api/health/ready`. Set `DB_SSL=false` with the Railway Postgres plugin.
 
+The AWS guides above still describe Amazon Cognito. Authentication has since
+moved into the application (see below); ignore the Cognito steps and the
+`AUTH_COGNITO_*` variables in those documents.
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
-## Authentication Configuration
+## Authentication and User Management
 
-ALINA uses Amazon Cognito Managed Login as its identity provider and Auth.js
-for the application session. Cognito owns credentials and account recovery;
-ALINA stores an encrypted JWT session in an HTTP-only cookie. The session lasts
-eight hours and no application database is required for this authentication
-slice.
+ALINA manages its own user accounts in PostgreSQL. Auth.js provides the
+session (an encrypted JWT in an HTTP-only cookie, valid for eight hours) and
+a Credentials provider verifies the email and password against the `users`
+table. There is no external identity provider and no self-registration:
+administrators create every account from the **Admin** tab.
 
-### Cognito user pool
+### How accounts work
 
-Create a Cognito user pool with these settings:
+- An administrator creates a user with an email, a display name, a role
+  (`admin` or `member`) and receives a generated temporary password to hand
+  over. The user must replace it at first sign-in before reaching any page.
+- Passwords are hashed with scrypt (`node:crypto`, N=2^17) and must be at
+  least 12 characters long. Users change their own password from the
+  **Password** link in the header.
+- Five failed sign-ins lock an account for 15 minutes. An administrator can
+  clear the lock immediately by issuing a new temporary password.
+- Disabling an account blocks sign-in and invalidates the existing session on
+  the next request, because every request re-reads the account from the
+  database. Conversations and files are kept.
+- At least one active administrator must always remain; the last one cannot
+  be demoted or disabled.
 
-1. Use email addresses as sign-in identifiers.
-2. Disable self-registration so pilot users are created by an administrator.
-3. Enable email-based account recovery and use Cognito's default password
-   policy.
-4. Add an AWS-managed prefix domain and set its branding version to **Managed
-   login**.
-5. Create a **Traditional web application** app client with a client secret.
-6. Under **Managed login > Styles**, create a style and assign it to the app
-   client. Without an assigned style, Cognito displays `Login pages
-   unavailable` even when the domain and OAuth settings are valid.
-7. Enable only the authorization-code grant and the `openid`, `email`, and
-   `profile` scopes.
-8. Select the Cognito user pool as the identity provider.
+### First administrator
 
-Register these local URLs on the app client:
-
-```text
-Allowed callback URL: http://localhost:3000/api/auth/callback/cognito
-Allowed sign-out URL: http://localhost:3000/login
-```
-
-Add the corresponding HTTPS URLs for the deployed application. A separate app
-client for production is recommended before the pilot expands.
-
-Create pilot users from the Cognito console. Cognito sends a temporary password
-and requires users to replace it on first sign-in.
+Set `ADMIN_EMAIL` and `ADMIN_PASSWORD` (optionally `ADMIN_NAME`) in the
+environment. When the server starts and the database contains no
+administrator, it creates that account with a temporary password that must
+be changed at first sign-in. Afterwards the variables are ignored, so they
+can stay in place or be removed. Further administrators are promoted from the
+Admin tab.
 
 ### Local environment
 
@@ -99,39 +97,31 @@ Generate the Auth.js secret with:
 openssl rand -base64 33
 ```
 
-Set the following values:
+The minimum set is:
 
 ```bash
 AUTH_SECRET=...
-AUTH_COGNITO_ID=...
-AUTH_COGNITO_SECRET=...
-AUTH_COGNITO_ISSUER=https://cognito-idp.<region>.amazonaws.com/<user-pool-id>
-AUTH_COGNITO_DOMAIN=https://<prefix>.auth.<region>.amazoncognito.com
-AUTH_POST_LOGOUT_URL=http://localhost:3000/login
+ADMIN_EMAIL=you@example.eu
+ADMIN_PASSWORD=a-temporary-password-of-12-chars-or-more
+DATABASE_URL=postgresql://alina:alina-local@localhost:5432/alina
 ```
 
-`AUTH_COGNITO_ISSUER` uses the user pool ID, not the app client ID. The domain
-is the Managed Login domain. Signing out first clears the Auth.js cookie and
-then redirects directly to the configured Cognito `/logout` URL so the Cognito
-browser session is also terminated. Auth.js accepts this external redirect only
-when it exactly matches the server-generated logout URL.
-
 All application pages, Haystack routes, and UAT routes require authentication.
-Only `/login`, `/api/auth/**`, and static assets are public.
+Only `/login`, `/api/auth/**`, `/api/health/**`, and static assets are public.
+The `/admin` page and the `/api/admin/**` routes additionally require the
+`admin` role.
 
-### ECS runtime
+### Deployed runtime
 
-Supply all authentication variables at container runtime; do not add them to
-the Docker image. Store `AUTH_SECRET` and `AUTH_COGNITO_SECRET` in AWS Secrets
-Manager and set `AUTH_TRUST_HOST=true` because ECS is behind a reverse proxy or
-load balancer. Use the externally visible HTTPS login URL for
-`AUTH_POST_LOGOUT_URL` and register the exact callback and sign-out URLs in
-Cognito.
+Supply `AUTH_SECRET` at container runtime and store it as a secret; do not
+add it to the Docker image. Behind a reverse proxy or load balancer (ECS with
+an ALB, Railway) set `AUTH_TRUST_HOST=true` and `AUTH_URL` to the public
+HTTPS URL.
 
-JWT sessions are intentionally stateless for this pilot. Disabling a Cognito
-account does not invalidate an ALINA cookie that was already issued; it expires
-within eight hours. Immediate administrative revocation belongs in the later
-database-backed user and role implementation.
+Accounts that existed before local authentication (created by the previous
+Cognito integration) have no password. They appear in the Admin tab with a
+**No password** badge; use **Set password** to give them an email, if
+missing, and a temporary password.
 
 ## Haystack Configuration
 

@@ -1,3 +1,5 @@
+> **Superseded (September 2026):** authentication no longer uses Amazon Cognito. Accounts, passwords and roles are managed inside ALINA (PostgreSQL `users` table, Auth.js Credentials provider). Skip every Cognito step and the `AUTH_COGNITO_*` / `AUTH_POST_LOGOUT_URL` variables below; see the README section "Authentication and User Management".
+
 # Diagram B — Application Components View
 
 > Next.js App Router app (`src/app`). Route protection is per-handler (`requireAppUser` / `requireUserId`); there is **no** `middleware.ts`. All Haystack calls are server-side proxies to `api.cloud.deepset.ai`.

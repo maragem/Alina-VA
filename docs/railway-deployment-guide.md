@@ -2,9 +2,8 @@
 
 Railway builds the root `Dockerfile`, provisions PostgreSQL as a plugin, and
 runs the database migrations from the same image before each deployment. The
-retrieval backend (deepset / Haystack) and the identity provider (Amazon
-Cognito) stay where they are; only the Next.js container and its database
-move to Railway.
+retrieval backend (deepset / Haystack) stays where it is; the Next.js
+container, its database, and the user accounts live on Railway.
 
 Configuration lives in [`railway.toml`](../railway.toml): Dockerfile builder,
 pre-deploy migration command, health check path, and restart policy.
@@ -32,13 +31,11 @@ the Postgres service and must be typed exactly as shown.
 | `DATABASE_URL` | ALINA | `${{Postgres.DATABASE_URL}}` *(ref)* | Private-network URL, no egress cost. If the Postgres service has a different name, use that name in place of `Postgres`. |
 | `DB_SSL` | ALINA | `false` | Railway's internal Postgres endpoint has no TLS. Without this the production default enforces TLS against the bundled AWS RDS CA and every connection fails. |
 | `AUTH_SECRET` | ALINA | `openssl rand -base64 33` | Mark as sealed. |
-| `AUTH_COGNITO_ID` | ALINA | Cognito app client ID | |
-| `AUTH_COGNITO_SECRET` | ALINA | Cognito app client secret | Mark as sealed. |
-| `AUTH_COGNITO_ISSUER` | ALINA | `https://cognito-idp.<region>.amazonaws.com/<user-pool-id>` | |
-| `AUTH_COGNITO_DOMAIN` | ALINA | `https://<prefix>.auth.<region>.amazoncognito.com` | |
 | `AUTH_URL` | ALINA | `https://<service>.up.railway.app` | The public domain Railway generates, or the custom domain. |
 | `AUTH_TRUST_HOST` | ALINA | `true` | Railway terminates TLS in front of the container. |
-| `AUTH_POST_LOGOUT_URL` | ALINA | `https://<service>.up.railway.app/login` | |
+| `ADMIN_EMAIL` | ALINA | first administrator's email | Used once, when the database has no admin yet. |
+| `ADMIN_PASSWORD` | ALINA | temporary password, 12+ characters | Mark as sealed. Must be changed at first sign-in. |
+| `ADMIN_NAME` | ALINA | display name | Optional, defaults to "ALINA administrator". |
 | `HAYSTACK_API_KEY` | ALINA | deepset API key | Mark as sealed. |
 | `HAYSTACK_WORKSPACE` | ALINA | workspace name | |
 | `HAYSTACK_PIPELINE` | ALINA | pipeline name | |
@@ -46,8 +43,7 @@ the Postgres service and must be typed exactly as shown.
 | `HAYSTACK_PIPELINE_ID` | ALINA | pipeline UUID | |
 | `HAYSTACK_INDEX` | ALINA | index name | |
 
-Optional, also on ALINA: `COGNITO_ADMIN_GROUP` (defaults to `Admins`),
-`DB_POOL_MAX`, `DB_STATEMENT_TIMEOUT_MS`.
+Optional, also on ALINA: `DB_POOL_MAX`, `DB_STATEMENT_TIMEOUT_MS`.
 
 Nothing is set on the Postgres service. Railway's `PGHOST`, `PGUSER`,
 `PGPASSWORD` and similar variables on that service are read-only outputs
@@ -59,22 +55,32 @@ must be 3000 (step 3).
 ## 3. Networking and health
 
 1. Settings > Networking > Generate Domain, target port **3000**.
-2. Copy the generated domain into `AUTH_URL` and `AUTH_POST_LOGOUT_URL`.
-3. In the Cognito app client, add the callback
-   `https://<domain>/api/auth/callback/cognito` and the sign-out URL
-   `https://<domain>/login`.
-4. The health check (`/api/health/ready`) queries the database, so the
+2. Copy the generated domain into `AUTH_URL`.
+3. The health check (`/api/health/ready`) queries the database, so the
    first deployment turns healthy only after the Postgres service is up and
    the pre-deploy migration has succeeded.
 
-## 4. Resources
+## 4. First sign-in
+
+1. Open the domain. You land on the sign-in page.
+2. Sign in with `ADMIN_EMAIL` and `ADMIN_PASSWORD`. You are asked to choose a
+   personal password before anything else.
+3. Open the **Admin** tab and create accounts for the other users. Each
+   creation shows a generated temporary password once; pass it on securely.
+   Users replace it at their first sign-in.
+
+The bootstrap only runs when the database holds no administrator, so
+`ADMIN_EMAIL` and `ADMIN_PASSWORD` can be deleted from the service after
+this step, or left in place; they have no further effect either way.
+
+## 5. Resources
 
 Document conversion spawns LibreOffice inside the container. Allow at least
 2 GB of memory and 1 vCPU for the ALINA service, matching the ECS sizing in
 the AWS runbook. Build time is several minutes because the runtime stage
 installs `libreoffice-writer`.
 
-## 5. Migrations
+## 6. Migrations
 
 `railway.toml` sets the pre-deploy command to `node scripts/migrate.mjs`.
 It runs in the new image with the service variables, takes a PostgreSQL
@@ -85,14 +91,15 @@ the previous version live.
 To run it by hand: Railway service > Deployments > the three-dot menu on the
 latest deployment > **Run a command**, then `node scripts/migrate.mjs`.
 
-## 6. Differences from the AWS deployment
+## 7. Differences from the AWS deployment
 
-- Conversation history, users, projects, and file scope records live in
-  Railway's PostgreSQL rather than in the EC AWS tenant. Confirm this is
-  acceptable for the data involved before using it beyond a pilot.
-- There is no NAT or private egress; the container reaches Cognito and
-  deepset over Railway's shared egress.
+- Conversation history, users, password hashes, projects, and file scope
+  records live in Railway's PostgreSQL rather than in the EC AWS tenant.
+  Confirm this is acceptable for the data involved before using it beyond a
+  pilot.
+- There is no NAT or private egress; the container reaches deepset over
+  Railway's shared egress.
 - The AWS RDS CA bundle is still baked into the image (harmless) but not
   used because `DB_SSL=false`.
 - Everything in `docs/aws-production-runbook.md` about ECS task
-  definitions, Secrets Manager, and the ALB does not apply.
+  definitions, Secrets Manager, the ALB, and Cognito does not apply.

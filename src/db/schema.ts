@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   AnyPgColumn,
+  boolean,
   index,
   integer,
   jsonb,
@@ -37,11 +38,26 @@ export const users = pgTable(
   {
     id: uuid("id").defaultRandom().primaryKey(),
     displayName: text("display_name").notNull(),
+    // Login identifier. Nullable for rows created before local authentication;
+    // such accounts cannot sign in until an administrator sets an email and password.
     email: text("email"),
     role: userRole("role").default("member").notNull(),
+    // scrypt hash produced by `@/lib/password`. Null means "no password set yet".
+    passwordHash: text("password_hash"),
+    // Set when an administrator issues a temporary password; cleared on first change.
+    mustChangePassword: boolean("must_change_password").default(false).notNull(),
+    disabledAt: timestamp("disabled_at", { withTimezone: true }),
+    failedLoginAttempts: integer("failed_login_attempts").default(0).notNull(),
+    lockedUntil: timestamp("locked_until", { withTimezone: true }),
+    lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
     ...timestamps,
   },
-  (table) => [index("users_email_idx").on(table.email)],
+  (table) => [
+    index("users_email_idx").on(table.email),
+    uniqueIndex("users_email_lower_uidx")
+      .on(sql`lower(${table.email})`)
+      .where(sql`${table.email} is not null`),
+  ],
 );
 
 export const externalIdentities = pgTable(

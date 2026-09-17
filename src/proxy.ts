@@ -1,5 +1,11 @@
+import NextAuth from "next-auth";
 import { NextResponse } from "next/server";
-import { auth } from "@/auth";
+import { authConfig } from "@/auth.config";
+
+// Provider-free instance: it only verifies the session cookie. Password checks,
+// account status, and the forced password change are enforced per request in
+// `requireAppUser` / `AppShell`, which have database access.
+const { auth } = NextAuth(authConfig);
 
 export const proxy = auth((request) => {
   if (request.auth?.user?.id) return NextResponse.next();

@@ -5,7 +5,7 @@ import {
   getHaystackPipelineId,
   getHaystackWorkspaceId,
 } from "@/lib/haystackConfig";
-import { requireUserId } from "@/lib/requireAuth";
+import { requireAppUser } from "@/lib/currentUser";
 
 const FEEDBACK_SCORES = ["ACCURATE", "FAIRLY_ACCURATE", "INACCURATE"] as const;
 type FeedbackScore = (typeof FEEDBACK_SCORES)[number];
@@ -110,8 +110,8 @@ async function proxyFeedback(
 }
 
 export async function POST(request: NextRequest): Promise<Response> {
-  const userId = await requireUserId();
-  if (userId instanceof Response) return userId;
+  const user = await requireAppUser();
+  if (user instanceof Response) return user;
 
   const configurationError = getConfigurationError();
   if (configurationError) return configurationError;
@@ -139,8 +139,8 @@ export async function POST(request: NextRequest): Promise<Response> {
 }
 
 export async function PATCH(request: NextRequest): Promise<Response> {
-  const userId = await requireUserId();
-  if (userId instanceof Response) return userId;
+  const user = await requireAppUser();
+  if (user instanceof Response) return user;
 
   const configurationError = getConfigurationError();
   if (configurationError) return configurationError;

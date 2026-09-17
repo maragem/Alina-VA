@@ -1,12 +1,12 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { requireUserId } from "@/lib/requireAuth";
+import { requireAdminUser } from "@/lib/currentUser";
 
 export const runtime = "nodejs";
 
 export async function GET(): Promise<Response> {
-  const userId = await requireUserId();
-  if (userId instanceof Response) return userId;
+  const user = await requireAdminUser();
+  if (user instanceof Response) return user;
 
   if (process.env.NODE_ENV !== "development") {
     return Response.json({ error: "Not found." }, { status: 404 });
