@@ -20,30 +20,38 @@ pre-deploy migration command, health check path, and restart policy.
 
 ## 2. Service variables
 
-Set these on the ALINA service (Settings > Variables). Values marked *ref*
-are Railway reference variables and must be typed exactly as shown.
+A Railway project here has two services: the **ALINA** app service (built
+from this repository) and the **Postgres** database service (the plugin).
+Every variable below is set on the **ALINA** service (select it, then
+Variables). The Postgres service manages its own variables; do not edit
+them. Values marked *ref* are Railway reference variables that read from
+the Postgres service and must be typed exactly as shown.
 
-| Variable | Value | Notes |
-| --- | --- | --- |
-| `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` *(ref)* | Private-network URL, no egress cost. |
-| `DB_SSL` | `false` | Railway's internal Postgres endpoint has no TLS. Without this the production default enforces TLS against the bundled AWS RDS CA and every connection fails. |
-| `AUTH_SECRET` | `openssl rand -base64 33` | Mark as sealed. |
-| `AUTH_COGNITO_ID` | Cognito app client ID | |
-| `AUTH_COGNITO_SECRET` | Cognito app client secret | Mark as sealed. |
-| `AUTH_COGNITO_ISSUER` | `https://cognito-idp.<region>.amazonaws.com/<user-pool-id>` | |
-| `AUTH_COGNITO_DOMAIN` | `https://<prefix>.auth.<region>.amazoncognito.com` | |
-| `AUTH_URL` | `https://<service>.up.railway.app` | The public domain Railway generates, or the custom domain. |
-| `AUTH_TRUST_HOST` | `true` | Railway terminates TLS in front of the container. |
-| `AUTH_POST_LOGOUT_URL` | `https://<service>.up.railway.app/login` | |
-| `HAYSTACK_API_KEY` | deepset API key | Mark as sealed. |
-| `HAYSTACK_WORKSPACE` | workspace name | |
-| `HAYSTACK_PIPELINE` | pipeline name | |
-| `HAYSTACK_WORKSPACE_ID` | workspace UUID | |
-| `HAYSTACK_PIPELINE_ID` | pipeline UUID | |
-| `HAYSTACK_INDEX` | index name | |
+| Variable | Set on | Value | Notes |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | ALINA | `${{Postgres.DATABASE_URL}}` *(ref)* | Private-network URL, no egress cost. If the Postgres service has a different name, use that name in place of `Postgres`. |
+| `DB_SSL` | ALINA | `false` | Railway's internal Postgres endpoint has no TLS. Without this the production default enforces TLS against the bundled AWS RDS CA and every connection fails. |
+| `AUTH_SECRET` | ALINA | `openssl rand -base64 33` | Mark as sealed. |
+| `AUTH_COGNITO_ID` | ALINA | Cognito app client ID | |
+| `AUTH_COGNITO_SECRET` | ALINA | Cognito app client secret | Mark as sealed. |
+| `AUTH_COGNITO_ISSUER` | ALINA | `https://cognito-idp.<region>.amazonaws.com/<user-pool-id>` | |
+| `AUTH_COGNITO_DOMAIN` | ALINA | `https://<prefix>.auth.<region>.amazoncognito.com` | |
+| `AUTH_URL` | ALINA | `https://<service>.up.railway.app` | The public domain Railway generates, or the custom domain. |
+| `AUTH_TRUST_HOST` | ALINA | `true` | Railway terminates TLS in front of the container. |
+| `AUTH_POST_LOGOUT_URL` | ALINA | `https://<service>.up.railway.app/login` | |
+| `HAYSTACK_API_KEY` | ALINA | deepset API key | Mark as sealed. |
+| `HAYSTACK_WORKSPACE` | ALINA | workspace name | |
+| `HAYSTACK_PIPELINE` | ALINA | pipeline name | |
+| `HAYSTACK_WORKSPACE_ID` | ALINA | workspace UUID | |
+| `HAYSTACK_PIPELINE_ID` | ALINA | pipeline UUID | |
+| `HAYSTACK_INDEX` | ALINA | index name | |
 
-Optional: `COGNITO_ADMIN_GROUP` (defaults to `Admins`), `DB_POOL_MAX`,
-`DB_STATEMENT_TIMEOUT_MS`.
+Optional, also on ALINA: `COGNITO_ADMIN_GROUP` (defaults to `Admins`),
+`DB_POOL_MAX`, `DB_STATEMENT_TIMEOUT_MS`.
+
+Nothing is set on the Postgres service. Railway's `PGHOST`, `PGUSER`,
+`PGPASSWORD` and similar variables on that service are read-only outputs
+that the `${{Postgres.DATABASE_URL}}` reference resolves against.
 
 Do not set `PORT`; the image listens on 3000 and the domain's target port
 must be 3000 (step 3).
