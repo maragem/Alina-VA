@@ -1,0 +1,1 @@
+# Static assets served from the site root. Kept so the Dockerfile COPY of /app/public succeeds on a clean checkout.

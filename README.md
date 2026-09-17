@@ -41,6 +41,12 @@ For a simpler, beginner-friendly AWS console path focused on ECS Express mode,
 Cognito, and RDS, see
 [`docs/aws-simple-deployment-guide.md`](docs/aws-simple-deployment-guide.md).
 
+To deploy on Railway instead, see
+[`docs/railway-deployment-guide.md`](docs/railway-deployment-guide.md). The
+repository ships a `railway.toml` that selects the Dockerfile builder, runs
+the migrations as a pre-deploy command, and points the health check at
+`/api/health/ready`. Set `DB_SSL=false` with the Railway Postgres plugin.
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
