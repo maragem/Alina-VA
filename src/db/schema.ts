@@ -9,6 +9,7 @@ import {
   pgTable,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
@@ -23,6 +24,11 @@ export const messageStatus = pgEnum("message_status", [
 export const projectRole = pgEnum("project_role", ["admin", "member"]);
 export const userRole = pgEnum("user_role", ["admin", "member"]);
 export const fileScope = pgEnum("file_scope", ["global", "project"]);
+export const wikiPageStatus = pgEnum("wiki_page_status", [
+  "draft",
+  "published",
+  "needs_review",
+]);
 
 const timestamps = {
   createdAt: timestamp("created_at", { withTimezone: true })
@@ -257,6 +263,78 @@ export const conversationAttachments = pgTable(
     index("conversation_attachments_active_idx")
       .on(table.conversationId, table.createdAt)
       .where(sql`${table.removedAt} is null`),
+  ],
+);
+
+/**
+ * LLM wiki: a curated, source-tracked tree of pages that consolidates the corpus.
+ * One knowledge base per project plus the global one (project_id null). Pages are
+ * Markdown; `[n]` in the content refers to the page's n-th source row.
+ */
+export const wikiPages = pgTable(
+  "wiki_pages",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    projectId: uuid("project_id").references(() => projects.id, {
+      onDelete: "cascade",
+    }),
+    parentId: uuid("parent_id").references((): AnyPgColumn => wikiPages.id, {
+      onDelete: "restrict",
+    }),
+    slug: text("slug").notNull(),
+    title: text("title").notNull(),
+    summary: text("summary"),
+    content: text("content").default("").notNull(),
+    status: wikiPageStatus("status").default("draft").notNull(),
+    // Legal standing of the governing source (1 = legal act ... 4 = internal guidance).
+    authorityRank: integer("authority_rank"),
+    sortOrder: integer("sort_order").default(0).notNull(),
+    createdByUserId: uuid("created_by_user_id")
+      .notNull()
+      .references(() => users.id),
+    updatedByUserId: uuid("updated_by_user_id")
+      .notNull()
+      .references(() => users.id),
+    lastReviewedAt: timestamp("last_reviewed_at", { withTimezone: true }),
+    // Provenance when a page was compiled from an ALINA answer.
+    sourceMessageId: uuid("source_message_id").references(() => messages.id, {
+      onDelete: "set null",
+    }),
+    ...timestamps,
+  },
+  (table) => [
+    // NULLS NOT DISTINCT so global pages (project_id null) also get unique slugs.
+    unique("wiki_pages_kb_slug_uq")
+      .on(table.projectId, table.slug)
+      .nullsNotDistinct(),
+    index("wiki_pages_tree_idx").on(table.projectId, table.parentId, table.sortOrder),
+  ],
+);
+
+export const wikiPageSources = pgTable(
+  "wiki_page_sources",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    pageId: uuid("page_id")
+      .notNull()
+      .references(() => wikiPages.id, { onDelete: "cascade" }),
+    // 1-based; matches the `[n]` markers in the page content.
+    position: integer("position").notNull(),
+    haystackFileId: uuid("haystack_file_id"),
+    documentId: text("document_id"),
+    fileName: text("file_name").notNull(),
+    // Human name of the instrument, e.g. "Financial Regulation 2024/2509, Article 2(47)".
+    locator: text("locator"),
+    quote: text("quote"),
+    pageNumber: integer("page_number"),
+    authorityRank: integer("authority_rank"),
+  },
+  (table) => [
+    uniqueIndex("wiki_page_sources_page_position_uidx").on(
+      table.pageId,
+      table.position,
+    ),
+    index("wiki_page_sources_file_idx").on(table.haystackFileId),
   ],
 );
 

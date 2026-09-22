@@ -16,7 +16,8 @@
     "haystack:access:check": "node scripts/backfill-haystack-access-metadata.mjs --check",
     "haystack:access:reindex": "node scripts/backfill-haystack-access-metadata.mjs --reindex",
     "haystack:skipped:dry-run": "node --env-file-if-exists=.env scripts/quarantine-haystack-skipped-files.mjs",
-    "haystack:skipped:quarantine": "node --env-file-if-exists=.env scripts/quarantine-haystack-skipped-files.mjs --apply"
+    "haystack:skipped:quarantine": "node --env-file-if-exists=.env scripts/quarantine-haystack-skipped-files.mjs --apply",
+    "wiki:seed-demo": "node --env-file-if-exists=.env scripts/seed-wiki-demo.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.6.0",

@@ -43,6 +43,13 @@
       "when": 1789670707597,
       "tag": "0005_worried_dracula",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790090209834,
+      "tag": "0006_previous_tana_nile",
+      "breakpoints": true
     }
   ]
 }

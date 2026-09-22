@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { Check, Copy, FileText, RefreshCw } from "lucide-react";
+import { BookMarked, Check, Copy, FileText, RefreshCw } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
@@ -10,6 +10,7 @@ import type { ChatMessage as ChatMessageType } from "./hooks/useChat";
 import type { ChatStatus as HaystackStatus } from "./hooks/useHaystackStream";
 import { ChatStatus } from "./ChatStatus";
 import { FeedbackButtons } from "./FeedbackButtons";
+import { SaveToWikiDialog } from "./SaveToWikiDialog";
 import { SourceDocumentList } from "./SourceDocumentList";
 import {
   citationNumberFromHref,
@@ -22,6 +23,11 @@ type ChatMessageProps = {
   message: ChatMessageType;
   streamStatus: HaystackStatus;
   onRetry: (messageId: string) => void;
+  /** Question this answer replies to, used to title a saved wiki page. */
+  question?: string;
+  /** Knowledge base the "Save to wiki" action proposes; null = global. */
+  wikiProjectId?: string | null;
+  wikiProjectName?: string;
 };
 
 type CitationLabel = Readonly<{
@@ -58,9 +64,13 @@ export function ChatMessage({
   message,
   streamStatus,
   onRetry,
+  question,
+  wikiProjectId = null,
+  wikiProjectName,
 }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
   const [selectedCitation, setSelectedCitation] = useState<SelectedCitation>();
+  const [saveToWikiOpen, setSaveToWikiOpen] = useState(false);
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   if (message.role === "user") {
@@ -232,7 +242,29 @@ export function ChatMessage({
               Retry
             </Button>
           ) : null}
+          {message.status === "complete" && message.text ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setSaveToWikiOpen(true)}
+              className="h-8 px-2 text-(--ec-blue)"
+              title="Save this grounded answer as a draft knowledge-base page"
+            >
+              <BookMarked className="size-4" aria-hidden="true" />
+              Save to wiki
+            </Button>
+          ) : null}
         </div>
+        <SaveToWikiDialog
+          open={saveToWikiOpen}
+          answerText={displayText}
+          sources={message.sources ?? []}
+          question={question}
+          messageId={message.id}
+          projectId={wikiProjectId}
+          projectName={wikiProjectName}
+          onClose={() => setSaveToWikiOpen(false)}
+        />
         {message.status === "complete" && message.feedback ? (
           <FeedbackButtons
             queryId={message.feedback.queryId}

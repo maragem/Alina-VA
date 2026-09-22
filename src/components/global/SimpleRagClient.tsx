@@ -262,13 +262,22 @@ export function SimpleRagClient({
                   aria-busy={isStreaming}
                   aria-label="Conversation"
                 >
-                  {messages.map((message) => (
+                  {messages.map((message, index) => (
                     <ChatMessage
                       key={message.id}
                       message={message}
                       activeToolName={activeToolName}
                       streamStatus={status}
                       onRetry={(messageId) => void retryMessage(messageId)}
+                      question={
+                        messages[index - 1]?.role === "user"
+                          ? messages[index - 1].text
+                          : undefined
+                      }
+                      wikiProjectId={activeProjectId ?? null}
+                      wikiProjectName={
+                        projects.find((project) => project.id === activeProjectId)?.name
+                      }
                     />
                   ))}
                 </div>

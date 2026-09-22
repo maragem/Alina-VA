@@ -8,7 +8,7 @@ import { UserAvatar } from "@/components/UserAvatar";
 import { getCurrentUser } from "@/lib/currentUser";
 
 type AppShellProps = {
-  activeTab: "global" | "projects" | "documents" | "admin";
+  activeTab: "global" | "projects" | "documents" | "wiki" | "admin";
   children: ReactNode;
   footerDetail: string;
 };
@@ -91,6 +91,13 @@ export async function AppShell({
               aria-current={activeTab === "documents" ? "page" : undefined}
             >
               Documents
+            </Link>
+            <Link
+              className={`ec-nav-tab ${activeTab === "wiki" ? "active" : "inactive"}`}
+              href="/wiki"
+              aria-current={activeTab === "wiki" ? "page" : undefined}
+            >
+              Wiki
             </Link>
             {user.role === "admin" ? (
               <Link

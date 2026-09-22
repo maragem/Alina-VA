@@ -18,8 +18,9 @@ export const proxy = auth((request) => {
   return NextResponse.redirect(loginUrl);
 });
 
+// `api/mcp` authenticates itself (bearer token for the pipeline, or a session).
 export const config = {
   matcher: [
-    "/((?!api/auth|api/health|login|_next/static|_next/image|favicon.ico|icon.svg).*)",
+    "/((?!api/auth|api/health|api/mcp|login|_next/static|_next/image|favicon.ico|icon.svg).*)",
   ],
 };

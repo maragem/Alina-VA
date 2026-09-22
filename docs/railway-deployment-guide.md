@@ -43,7 +43,9 @@ the Postgres service and must be typed exactly as shown.
 | `HAYSTACK_PIPELINE_ID` | ALINA | pipeline UUID | |
 | `HAYSTACK_INDEX` | ALINA | index name | |
 
-Optional, also on ALINA: `DB_POOL_MAX`, `DB_STATEMENT_TIMEOUT_MS`.
+Optional, also on ALINA: `DB_POOL_MAX`, `DB_STATEMENT_TIMEOUT_MS`, and
+`WIKI_MCP_TOKEN` (enables the knowledge-base MCP endpoint for the pipeline;
+see `docs/llmwiki.md`).
 
 Nothing is set on the Postgres service. Railway's `PGHOST`, `PGUSER`,
 `PGPASSWORD` and similar variables on that service are read-only outputs
