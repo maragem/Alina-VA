@@ -32,7 +32,7 @@ the Postgres service and must be typed exactly as shown.
 | `DB_SSL` | ALINA | `false` | Railway's internal Postgres endpoint has no TLS. Without this the production default enforces TLS against the bundled AWS RDS CA and every connection fails. |
 | `AUTH_SECRET` | ALINA | `openssl rand -base64 33` | Mark as sealed. |
 | `AUTH_URL` | ALINA | `https://<service>.up.railway.app` | The public domain Railway generates, or the custom domain. |
-| `AUTH_TRUST_HOST` | ALINA | `true` | Railway terminates TLS in front of the container. |
+| `AUTH_TRUST_HOST` | ALINA | `true` | Optional since the app trusts the forwarded host by default; harmless to set. |
 | `ADMIN_EMAIL` | ALINA | first administrator's email | Used once, when the database has no admin yet. |
 | `ADMIN_PASSWORD` | ALINA | temporary password, 12+ characters | Mark as sealed. Must be changed at first sign-in. |
 | `ADMIN_NAME` | ALINA | display name | Optional, defaults to "ALINA administrator". |

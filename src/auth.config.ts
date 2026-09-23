@@ -9,6 +9,10 @@ const SESSION_MAX_AGE_SECONDS = 8 * 60 * 60;
  */
 export const authConfig = {
   providers: [],
+  // Every deployment target (ECS behind an ALB, Railway) terminates TLS in front of
+  // the container, so the forwarded host is the only host there is. Set AUTH_URL to
+  // the public URL to pin it explicitly.
+  trustHost: true,
   pages: {
     signIn: "/login",
   },
