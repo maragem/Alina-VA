@@ -1,12 +1,12 @@
 # Deploying ALINA on Railway
 
-Railway builds the root `Dockerfile`, provisions PostgreSQL as a plugin, and
-runs the database migrations from the same image before each deployment. The
+Railway builds the root `Dockerfile` and provisions PostgreSQL as a plugin;
+the container applies the database migrations itself when it starts. The
 retrieval backend (deepset / Haystack) stays where it is; the Next.js
 container, its database, and the user accounts live on Railway.
 
 Configuration lives in [`railway.toml`](../railway.toml): Dockerfile builder,
-pre-deploy migration command, health check path, and restart policy.
+health check path, and restart policy.
 
 ## 1. Create the project
 
