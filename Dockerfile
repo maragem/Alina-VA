@@ -17,10 +17,12 @@ WORKDIR /app
 # Copy package-related files first to leverage Docker's caching mechanism
 COPY package.json yarn.lock* package-lock.json* pnpm-lock.yaml* pnpm-workspace.yaml* .npmrc* ./
 
-# Install project dependencies with frozen lockfile for reproducible builds
-RUN --mount=type=cache,target=/root/.npm \
-    --mount=type=cache,target=/usr/local/share/.cache/yarn \
-    --mount=type=cache,target=/root/.local/share/pnpm/store \
+# Install project dependencies with frozen lockfile for reproducible builds.
+# Cache mounts carry an explicit `id`: Railway's BuildKit frontend rejects mounts
+# without one ("missing an id argument"), while Docker itself does not require it.
+RUN --mount=type=cache,id=alina-npm-cache,target=/root/.npm \
+    --mount=type=cache,id=alina-yarn-cache,target=/usr/local/share/.cache/yarn \
+    --mount=type=cache,id=alina-pnpm-store,target=/root/.local/share/pnpm/store \
   if [ -f package-lock.json ]; then \
     npm ci --no-audit --no-fund; \
   elif [ -f yarn.lock ]; then \
