@@ -51,16 +51,16 @@ Nothing is set on the Postgres service. Railway's `PGHOST`, `PGUSER`,
 `PGPASSWORD` and similar variables on that service are read-only outputs
 that the `${{Postgres.DATABASE_URL}}` reference resolves against.
 
-Do not set `PORT`; the image listens on 3000 and the domain's target port
-must be 3000 (step 3).
+Do not set `PORT`. Railway injects its own value and the server listens on
+it; the generated domain is routed to that port automatically.
 
 ## 3. Networking and health
 
-1. Settings > Networking > Generate Domain, target port **3000**.
+1. Settings > Networking > Generate Domain (accept the detected port).
 2. Copy the generated domain into `AUTH_URL`.
 3. The health check (`/api/health/ready`) queries the database, so the
    first deployment turns healthy only after the Postgres service is up and
-   the pre-deploy migration has succeeded.
+   the start-up migration has succeeded.
 
 ## 4. First sign-in
 
@@ -84,14 +84,11 @@ installs `libreoffice-writer`.
 
 ## 6. Migrations
 
-`railway.toml` sets the pre-deploy command to `node scripts/migrate.mjs`.
-It runs in the new image with the service variables, takes a PostgreSQL
-advisory lock, applies the versioned SQL in `drizzle/`, and only then does
-Railway switch traffic. A failed migration aborts the deployment and keeps
-the previous version live.
-
-To run it by hand: Railway service > Deployments > the three-dot menu on the
-latest deployment > **Run a command**, then `node scripts/migrate.mjs`.
+The container applies pending migrations itself at start: the Dockerfile's
+command runs `node scripts/migrate.mjs` (advisory-locked, so parallel
+instances cannot race) and only then starts the server. A failed migration
+prevents the server from starting, so Railway keeps the previous deployment
+live. Nothing needs to be configured in Railway for this.
 
 ## 7. Differences from the AWS deployment
 

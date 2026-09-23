@@ -132,5 +132,8 @@ USER node
 # Expose port 3000 to allow HTTP traffic
 EXPOSE 3000
 
-# Start Next.js standalone server
-CMD ["node", "server.js"]
+# Apply pending database migrations, then start the Next.js standalone server.
+# The migration script takes a PostgreSQL advisory lock, so several instances
+# starting at once cannot race; if it fails the server does not start and the
+# platform keeps the previous deployment serving traffic.
+CMD ["sh", "-c", "node scripts/migrate.mjs && node server.js"]
