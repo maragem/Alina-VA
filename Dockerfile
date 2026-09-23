@@ -18,12 +18,10 @@ WORKDIR /app
 COPY package.json yarn.lock* package-lock.json* pnpm-lock.yaml* pnpm-workspace.yaml* .npmrc* ./
 
 # Install project dependencies with frozen lockfile for reproducible builds.
-# Cache mounts carry an explicit `id`: Railway's BuildKit frontend rejects mounts
-# without one ("missing an id argument"), while Docker itself does not require it.
-RUN --mount=type=cache,id=alina-npm-cache,target=/root/.npm \
-    --mount=type=cache,id=alina-yarn-cache,target=/usr/local/share/.cache/yarn \
-    --mount=type=cache,id=alina-pnpm-store,target=/root/.local/share/pnpm/store \
-  if [ -f package-lock.json ]; then \
+# No BuildKit cache mounts: Railway's builder only accepts them with a
+# service-specific `id=s/<service-id>-...` prefix, so they are omitted to keep
+# the Dockerfile portable. Dependency installs run from scratch on each build.
+RUN if [ -f package-lock.json ]; then \
     npm ci --no-audit --no-fund; \
   elif [ -f yarn.lock ]; then \
     corepack enable yarn && yarn install --frozen-lockfile --production=false; \
