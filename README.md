@@ -1,5 +1,9 @@
 # ALINA
 
+Procurement intelligence assistant for DIGIT.R3: source-grounded answers over
+a curated procurement corpus, project-scoped retrieval, document management,
+and an LLM wiki read by the agent over MCP (see `docs/llmwiki.md`).
+
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started
