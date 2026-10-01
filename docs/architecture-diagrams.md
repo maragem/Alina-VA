@@ -11,6 +11,14 @@ Source of truth for each diagram:
 | 3. Agent tools (internals) | same | v1 draft 9 |
 | 4. AWS architecture | `docs/aws-production-runbook.md` | 04/09/2026 |
 
+A single-page overview of the current state (application with built-in
+authentication on a container host, AI@EC query and indexing pipelines,
+GPT@EC; the LLM wiki deliberately left out) is at
+[`architecture/alina-architecture-current.svg`](architecture/alina-architecture-current.svg)
+(PNG alongside). It reflects the query pipeline draft with three tools as
+shared on 01/10/2026; the handed-over `v1-agent-9k.yaml` additionally carries
+the `consult_reference_qa` tool, 10 agent steps and temperature 0.
+
 ---
 
 ## 1. Indexing pipeline (Haystack v0.6)
