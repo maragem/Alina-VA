@@ -1,0 +1,14 @@
+# Curated reference Q&A for the SUMMA assistant, read by configs/summa.yaml.
+# One entry per real helpdesk or peer-exchange case, validated by the support team.
+# Guidance for the agent, never cited: the agent retrieves and cites the documents named
+# in `sources`. Keep answers factual and short; the agent writes the final text.
+#
+# entries:
+# - question: How do I request a down payment on a purchase order?
+#   answer: >-
+#     Open the Manage Down Payment Requests app, reference the purchase order, enter the
+#     amount within the contractual pre-financing percentage, and submit for approval.
+#   sources:
+#   - SUMMA Payments User Guide v3, section 4.2
+#   - Release notes 2025-Q2, item 7
+entries: []

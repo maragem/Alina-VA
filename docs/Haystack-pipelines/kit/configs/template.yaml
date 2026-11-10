@@ -1,0 +1,120 @@
+# =============================================================================
+# TEMPLATE config for a new RAG assistant. Copy, rename, fill the UPPERCASE parts.
+#   python build_pipeline.py configs/<name>.yaml -o <name>-agent.yaml --check
+#   python build_indexing.py configs/<name>.yaml -o <name>-indexing.yaml --check
+# Everything not listed here has a default (see DEFAULTS in build_pipeline.py). Sections
+# marked OPTIONAL can be deleted. The architecture itself is fixed; see README.md.
+# =============================================================================
+name: template
+
+# Lines written as comments at the top of both generated pipelines. OPTIONAL.
+header_notes: |
+  ASSISTANT-NAME - agent and indexing pipelines generated from configs/template.yaml.
+
+# --- The language model behind the agent. Tool calling must be supported.
+generator:
+  kind: bedrock                        # bedrock | openai (OpenAI-compatible gateway)
+  model: eu.anthropic.claude-opus-5-5
+  region: eu-west-1                    # bedrock only
+  # api_base_url: https://.../v1       # openai only
+  # api_key_env: MY_GATEWAY_API_KEY    # openai only: env var holding the key
+  streaming: false                     # keep off for the first deployment, then enable
+
+agent:
+  max_steps: 8                         # ~3-4 tool rounds + answer; each search runs two reranker passes
+
+# --- The index. Read by BOTH builders: the query side and the writer can never disagree.
+store:
+  index: MY-INDEX-NAME                 # give a re-indexed corpus a NEW name, keep the old one serving
+  embedding_dim: 1024                  # 1024 for multilingual-e5-large, 768 for e5-base-v2
+  # extra: {use_ssl: false}            # extra OpenSearchDocumentStore parameters, if your cluster needs them
+
+retrieval:
+  embedder_model: intfloat/multilingual-e5-large   # e5 prefixes are added automatically on both sides
+  # reranker_model: tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+  # bm25_top_k: 30 / embedding_top_k: 30 / rerank_top_k: 10 / rescore_top_k: 30 / window_size: 1
+  group_by: file_id                    # or a ranking field such as authority_rank
+  subgroup_by: null                    # file_id when group_by is a ranking field
+  sort_docs_by: split_id
+
+# --- Indexing: formats and preprocessing. All formats pass through a splitter.
+indexing:
+  formats: [txt, md, html, pdf, docx, pptx, xlsx, csv, png, jpeg]   # also: doc, odt
+  chunk_words: 250                     # keep at or below 300: e5 models truncate at 512 tokens
+  chunk_overlap: 50
+  chunk_threshold: 30                  # merges header-only fragments instead of emitting them
+  pdf_ocr: true                        # scanned pages
+  docx_ocr: false                      # true if Word files embed screenshots whose text matters
+  picture_description: false           # true if figures and screenshots carry meaning (cost at indexing time)
+  structure_profiles: [numbered]       # numbered (manuals, guidance) | legal | contract | judgment
+  # Metadata derived from the FILE NAME when upload metadata is absent. OPTIONAL.
+  filename_rules:
+  - {field: version, pattern: '[\s_-]v(\d+(?:\.\d+)*)\b'}
+  - {field: document_date, pattern: '(20\d{2}-\d{2}(?:-\d{2})?)'}
+  # Fields the agent groups or sorts on must never be null. OPTIONAL.
+  meta_defaults: {}                    # e.g. {authority_rank: 5}
+
+# --- Feature flags.
+features:
+  entitlement_filters: false           # true: per-user filters input, ANDed into every retriever
+  attachments: true                    # files input, converted, budgeted, citable
+  reference_qa: true                   # curated Q&A tool (guidance, never cited)
+  named_document_tools: true           # list_corpus_files + search_in_file
+
+# --- What metadata the model sees on passages and listings.
+metadata:
+  extra_attrs: [doc_type, version, document_date]      # rendered on each passage when present
+  listing_fields: [doc_type, version, document_date]   # one column each in list_corpus_files
+  listing_sort: []                     # e.g. [authority_rank]; listings sort by name after these
+  listing_order_label: alphabetical
+  attachment_stamp: {doc_type: attachment}             # e.g. {authority_rank: 0} to rank attachments above everything
+
+# --- Vocabulary. Synonym groups: first the form users write, then what the documents say.
+# They drive a deterministic query expander inside the search tools and a prompt section.
+# The glossary is rendered in the prompt so the model reads users' shorthand correctly.
+vocabulary:
+  synonyms:
+  - [ABBR, Full Name Of The Thing]
+  glossary:
+    ABBR: what users mean when they write ABBR
+
+# --- Curated Q&A: real questions with expert answers and the documents they rely on.
+# Guidance for the agent, never cited. Fill from helpdesk tickets. YAML/JSON list or CSV.
+reference_qa:
+  entries_file: ../qa/template.yaml
+  domain_stopwords: [SYSTEMNAME]       # words so common in this domain they carry no signal
+  top_k: 3
+
+# --- Tool descriptions. OPTIONAL: the defaults are domain-neutral; override to name the domain.
+tools:
+  search_corpus:
+    description: >-
+      Search the whole SYSTEMNAME documentation corpus with a short, self-contained query.
+      Use for any question that does not target one specific document. Returns the most
+      relevant passages, each tagged with a reference token for citation.
+
+# --- The prompt. persona is required; everything else has a neutral default.
+prompt:
+  persona: |
+    You are ASSISTANT-NAME, the virtual assistant for users of SYSTEMNAME. You answer from
+    the SYSTEMNAME documentation corpus that you access through your search tools, plus any
+    files the user attached to the conversation.
+  system_description: |
+    SYSTEMNAME is ... (what the system does, who uses it, how users refer to its parts).
+    The corpus holds ... (which document families exist and which supersede which).
+  # procedure: |                      # domain routing rules; default: reference Q&A, named documents, then search
+  # no_refusal: |                     # default: "NEVER refuse on the topic of the question before searching..."
+  # completeness: |                   # what "complete" means for this domain's answers
+  # ranking_rule: |                   # which source wins when several agree or disagree (version, authority)
+  domain_sections: |
+    # Scope of what you can do
+    - You give information and guidance grounded in the documents. You cannot act in
+    SYSTEMNAME on the user's behalf. Say so if asked.
+    # When information cannot be found
+    - If, after searching and reformulating, the documents do not answer the question, say
+    so, say what you searched for, and point the user to SUPPORT-CHANNEL.
+  style: |
+    - Structured Markdown when it helps: numbered steps for procedures, a short definition
+    for concepts. Start directly with the answer.
+    - Preserve exact names, labels, codes and references as written in the documents.
+    - Answer in European English unless the user asks for another language.

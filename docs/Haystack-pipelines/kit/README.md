@@ -11,7 +11,9 @@ kit/
   build_pipeline.py      config -> agent (query) pipeline YAML
   build_indexing.py      the SAME config -> indexing pipeline YAML
   components/*.py        the Code components, as importable, unit-tested Python
+  configs/template.yaml  START HERE for a new use case: every section explained
   configs/*.yaml         one per use case (summa, procurement-authority, minimal)
+  qa/*.yaml              curated reference Q&A per use case (YAML list or CSV)
   checks/verify_pipeline.py   structural checks for any built agent pipeline
   checks/verify_indexing.py   structural checks for an indexing pipeline + agreement with the config
   tests/                 pytest: components, builds, verifiers, equality with the hand-written SUMMA draft
@@ -66,6 +68,18 @@ rebuilds them as plain user and assistant text, dropping tool-call residue and a
 content-less, because an Agent hands the list straight to the generator, which rejects an
 empty message.
 
+**Vocabulary.** Users write shorthand; documents do not. The synonym groups in the config
+drive a `query_expander` Code component inside both search tools: when any form of a group
+appears in the model's query as a whole word, the other forms are appended before BM25 and
+the dense retriever run. The rerankers keep judging against the model's own query. The same
+groups and the glossary are rendered in the prompt, so the model also reads the user's
+shorthand correctly, but retrieval no longer depends on the model remembering to expand.
+
+**System description.** A prompt section between the persona and the tools: what the system
+does, how users refer to its parts, which document families the corpus holds and which
+supersede which. It is the one place where "the system" is explained to the model; the
+persona says who the assistant is, the system description says what it is about.
+
 **Entitlement (optional).** Per-user filters arrive as a pipeline input, live in agent
 state, and are ANDed into every retriever by Code components. They are never a model
 argument: a state-fed parameter must be kept out of the tool's explicit `parameters`, or
@@ -81,9 +95,10 @@ PipelineTool derives a schema that asks the model to supply it.
 | `features` | the four flags below | |
 | `metadata` | which metadata is shown on passages and listings, how listings sort, what attachments are stamped with | `[doc_type, version, document_date]` or `[authority_rank]` |
 | `limits` | per-passage characters, passages per call, files per listing, attachment chunks, history turns | |
-| `reference_qa` | the curated entries, domain stopwords, tool description | from helpdesk tickets |
+| `reference_qa` | the curated entries (inline or `entries_file`, YAML or CSV), domain stopwords, tool description | from helpdesk tickets |
+| `vocabulary` | synonym groups (users' form first, then the documents' forms) and a glossary | `[PO, Purchase Order]`; `LAM: the Local Authorisation Manager ...` |
 | `tools` | tool descriptions and the formatter texts | |
-| `prompt` | persona, routing procedure, completeness and ranking rules, domain sections, style | |
+| `prompt` | persona, system description, routing procedure, completeness and ranking rules, domain sections, style | |
 
 Feature flags:
 
@@ -114,6 +129,15 @@ Each of these cost at least one deployment on ALINA. The kit makes them structur
 | Scanning chunks hits the store's 10 000-hit cap; scan files instead | `split_id == 0` filter on the scan |
 | Missing structural metadata (headers) cannot be fixed at query time | README section 4: check the indexing pipeline first |
 
+### The four inputs every use case has
+
+| You have | Where it goes | What it becomes |
+|---|---|---|
+| Documents in many formats | the indexing pipeline (`indexing.formats`) | one hybrid index, Docling for PDF, DOCX and images, every chunk with a header and a `split_id` |
+| A vocabulary (abbreviations, synonyms, jargon) | `vocabulary.synonyms`, `vocabulary.glossary` | a deterministic query expander in the search tools, plus a prompt section |
+| Q&A sets (helpdesk answers, FAQs, expert exemplars) | `reference_qa.entries_file` | the `consult_reference_qa` tool: guidance the agent consults first and never cites |
+| A persona and a system description | `prompt.persona`, `prompt.system_description` | the opening of the system prompt; the doctrine that follows is fixed |
+
 ## 3. Decision guide: do you need the agent at all?
 
 Start from a fixed chain if you have one. Build 30 golden questions from real tickets, run
@@ -135,7 +159,8 @@ ALINA 9k averages 37 seconds per answer against a few seconds for a fixed chain.
    Decide the ranking metadata (version and date, or authority) and attach it at ingestion.
    ALINA's `../indexing-v06.yaml` is the reference indexing pipeline (Docling with OCR,
    structure promoter, Markdown header splitter at 250 words with 50 overlap).
-2. **Copy `configs/minimal.yaml`**, set the index and the persona, build with `--check`:
+2. **Copy `configs/template.yaml`** (every section explained; `minimal.yaml` is the smallest
+   working build), set the index, the persona and the system description, build with `--check`:
    ```
    python build_pipeline.py configs/<name>.yaml -o <out>.yaml --check
    ```
@@ -186,7 +211,9 @@ by `checks/verify_indexing.py`, and each one was a real failure in ALINA or Paci
 | Re-index after any change, under a new index name | Index-time metadata never applies retroactively. A new name keeps the old index queryable until the new one is validated; bump the config and rebuild both pipelines. |
 
 Changing the embedding model is therefore two config lines plus a new index name:
-`retrieval.embedder_model` and `store.embedding_dim`. The tests include that switch.
+`retrieval.embedder_model` and `store.embedding_dim`. The tests include that switch. The
+default is `intfloat/multilingual-e5-large` at 1024, the model of the Docling-based Pacioli
+indexer, which also covers questions asked in French or another EU language.
 
 ## 5. Checks and tests
 
@@ -205,6 +232,8 @@ Changing the embedding model is therefore two config lines plus a new index name
 - `checks/verify_indexing.py <indexing.yaml> <config.yaml>`: the indexing rules of section
   4b, plus agreement with the config: index, dimension, model, prefixes, and a note when the
   agent shows a metadata field nothing derives.
+- `tests/test_vocabulary.py`: the query expander, its wiring, the system description and
+  glossary in the prompt, Q&A files in YAML and CSV, and the template config.
 - `tests/test_indexing.py`: structure promoter and metadata finalizer against real haystack
   classes, every config's indexing build, agreement between the indexing and agent builds
   of one config, and the embedding-model switch changing both sides.

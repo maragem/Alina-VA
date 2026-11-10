@@ -76,7 +76,9 @@ def _strip(node, drop=("code", "system_prompt")):
 
 
 def test_summa_build_matches_hand_written_draft1():
-    cfg = load_config(KIT / "configs" / "summa.yaml")
+    # The frozen fixture is the config as it was when draft 1 was written by hand; the live
+    # configs/summa.yaml has since moved on (embedding model, vocabulary, system description).
+    cfg = load_config(KIT / "tests" / "fixtures" / "summa-draft1.yaml")
     built = build(cfg)
     draft = yaml.safe_load(DRAFT1.read_text(encoding="utf-8"))
     assert _strip(built) == _strip(draft), "everything but code bodies and the system prompt must be identical"

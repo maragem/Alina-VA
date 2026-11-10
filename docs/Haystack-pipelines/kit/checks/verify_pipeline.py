@@ -167,6 +167,20 @@ def verify(Y: dict, raw: str, cfg: dict | None = None) -> list[str]:
         chk({("file_filter.filters", "bm25_retriever.filters"), ("file_filter.filters", "embedding_retriever.filters")} <= conns,
             "search_in_file: file filter must reach both retrievers")
 
+    # --- vocabulary: expander present when synonyms configured, prompt carries system and glossary
+    if cfg:
+        syn = [g for g in cfg["vocabulary"]["synonyms"] if len(g) > 1]
+        for name in ("search_corpus", "search_in_file"):
+            if name in tools:
+                pc = tools[name]["pipeline"]["components"]
+                chk(("query_expander" in pc) == bool(syn), f"{name}: query_expander must be present iff vocabulary.synonyms is set")
+                if syn:
+                    conns = {(c["sender"], c["receiver"]) for c in tools[name]["pipeline"]["connections"]}
+                    chk(("query_expander.query", "bm25_retriever.query") in conns and
+                        ("query_expander.query", "query_embedder.text") in conns, f"{name}: expander must feed both retrievers")
+                    chk(("retrieval_query.output", "ranker.query") not in conns and
+                        "ranker.query" in tools[name]["input_mapping"]["query"], f"{name}: rerankers must see the model's own query")
+
     # --- prompt doctrine and Jinja sanity
     sp = " ".join(agent.get("system_prompt", "").split())
     for frag in DOCTRINE:
@@ -177,6 +191,11 @@ def verify(Y: dict, raw: str, cfg: dict | None = None) -> list[str]:
     if cfg:
         first = cfg["prompt"]["persona"].strip().splitlines()[0].strip()
         chk(first in sp, "prompt: persona first line missing")
+        if cfg["prompt"]["system_description"]:
+            chk("# The system and the corpus" in sp and
+                " ".join(cfg["prompt"]["system_description"].split())[:60] in sp, "prompt: system description missing")
+        for term in cfg["vocabulary"]["glossary"]:
+            chk(f"{term} =" in sp, f"prompt: glossary term {term} missing")
     for tname in tools:
         chk(f"`{tname}`" in sp, f"prompt: tool {tname} not described")
 

@@ -42,10 +42,10 @@ DEFAULTS: dict[str, Any] = {
     "generator": {"kind": "bedrock", "model": "eu.anthropic.claude-opus-5-5", "region": "eu-west-1",
                   "generation_kwargs": {}, "streaming": False},
     "agent": {"max_steps": 8},
-    "store": {"index": None, "embedding_dim": 768, "extra": {}},
+    "store": {"index": None, "embedding_dim": 1024, "extra": {}},
     "retrieval": {
         "bm25_top_k": 30, "embedding_top_k": 30, "fuzziness": 0,
-        "embedder_model": "intfloat/e5-base-v2",
+        "embedder_model": "intfloat/multilingual-e5-large",
         "reranker_model": "tomaarsen/Qwen3-Reranker-0.6B-seq-cls",
         "rerank_top_k": 10, "rescore_top_k": 30, "batch_size": 8, "window_size": 1,
         "group_by": "file_id", "subgroup_by": None, "sort_docs_by": "split_id",
@@ -63,11 +63,17 @@ DEFAULTS: dict[str, Any] = {
     },
     "limits": {"per_doc_chars": 12000, "max_docs_per_call": 30, "max_files_unfiltered": 600,
                "max_attachment_docs": 40, "max_history_messages": 20},
-    "reference_qa": {"entries": [], "domain_stopwords": [], "top_k": 3, "description": None,
-                     "query_description": None},
+    "reference_qa": {"entries": [], "entries_file": None, "domain_stopwords": [], "top_k": 3,
+                     "description": None, "query_description": None},
+    # Domain vocabulary. `synonyms`: groups of forms users and documents use for one thing;
+    # they drive a deterministic query expander inside the search tools AND a prompt
+    # section. `glossary`: term -> meaning, rendered in the prompt so the model reads the
+    # user's shorthand the way a colleague would.
+    "vocabulary": {"synonyms": [], "glossary": {}},
     "tools": {"search_corpus": {}, "search_in_file": {}, "list_corpus_files": {}},
-    "prompt": {"persona": None, "procedure": None, "completeness": None, "ranking_rule": None,
-               "search_vocabulary": None, "domain_sections": "", "style": None, "no_refusal": None},
+    "prompt": {"persona": None, "system_description": None, "procedure": None, "completeness": None,
+               "ranking_rule": None, "search_vocabulary": None, "domain_sections": "", "style": None,
+               "no_refusal": None},
     "header_notes": "",
     "indexing": {
         "formats": ["txt", "md", "html", "pdf", "docx", "pptx", "xlsx", "csv", "png", "jpeg"],
@@ -106,7 +112,33 @@ def load_config(path: str | Path) -> dict:
     if not cfg["prompt"]["persona"]:
         raise SystemExit("config: prompt.persona is required")
     cfg.setdefault("name", Path(path).stem)
+    rq = cfg["reference_qa"]
+    if rq.get("entries_file"):
+        rq["entries"] = list(rq["entries"]) + load_qa_entries(Path(path).parent / rq["entries_file"])
     return cfg
+
+
+def load_qa_entries(path: Path) -> list[dict]:
+    """Reads reference Q&A entries from YAML/JSON (a list, or {entries: [...]}) or CSV
+    (columns question, answer, sources; several sources separated by ';')."""
+    if not path.exists():
+        raise SystemExit(f"config: reference_qa.entries_file not found: {path}")
+    if path.suffix.lower() == ".csv":
+        import csv
+        with path.open(encoding="utf-8", newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        entries = [{"question": r["question"], "answer": r["answer"],
+                    "sources": [x.strip() for x in (r.get("sources") or "").split(";") if x.strip()]} for r in rows]
+    else:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+        entries = data["entries"] if isinstance(data, dict) else data
+    out = []
+    for e in entries or []:
+        if not e.get("question") or not e.get("answer"):
+            raise SystemExit(f"config: every reference Q&A entry needs question and answer ({path})")
+        out.append({"question": str(e["question"]).strip(), "answer": str(e["answer"]).strip(),
+                    "sources": [str(x) for x in (e.get("sources") or [])]})
+    return out
 
 
 # ------------------------------------------------------------------------- components
@@ -196,6 +228,7 @@ def attachment_converter(cfg: dict) -> dict:
 # ------------------------------------------------------------------------------ tools
 def retrieval_chain(cfg: dict, formatter_values: dict[str, Any]) -> tuple[dict, list]:
     r = cfg["retrieval"]
+    synonyms = [list(g) for g in cfg["vocabulary"]["synonyms"] if len(g) > 1]
     ranker_common = {"model": r["reranker_model"], "batch_size": r["batch_size"],
                      "meta_fields_to_embed": ["header", "file_name"], "embedding_separator": "\\n"}
     components = {
@@ -227,6 +260,11 @@ def retrieval_chain(cfg: dict, formatter_values: dict[str, Any]) -> tuple[dict, 
                                 "sort_docs_by": r["sort_docs_by"]}},
         "result_formatter": code_component("result_formatter", formatter_values),
     }
+    if synonyms:
+        # Sits after the length cap and before both retrievers. The rerankers keep judging
+        # against the model's own query (mapped directly), not the expanded one.
+        components = {"retrieval_query": components.pop("retrieval_query"),
+                      "query_expander": code_component("query_expander", {"synonyms": synonyms}), **components}
     # The ranker dicts above have top_k after the common keys; re-order to match the
     # hand-written layout (model, top_k, batch_size, ...). Cosmetic, keeps diffs readable.
     for name in ("ranker", "ranker_scoring"):
@@ -237,9 +275,10 @@ def retrieval_chain(cfg: dict, formatter_values: dict[str, Any]) -> tuple[dict, 
             if k in p:
                 ordered[k] = p[k]
         components[name]["init_parameters"] = ordered
-    connections = [
-        {"sender": "retrieval_query.output", "receiver": "bm25_retriever.query"},
-        {"sender": "retrieval_query.output", "receiver": "query_embedder.text"},
+    query_source = "query_expander.query" if synonyms else "retrieval_query.output"
+    connections = ([{"sender": "retrieval_query.output", "receiver": "query_expander.query"}] if synonyms else []) + [
+        {"sender": query_source, "receiver": "bm25_retriever.query"},
+        {"sender": query_source, "receiver": "query_embedder.text"},
         {"sender": "bm25_retriever.documents", "receiver": "document_joiner.documents"},
         {"sender": "query_embedder.embedding", "receiver": "embedding_retriever.query_embedding"},
         {"sender": "embedding_retriever.documents", "receiver": "document_joiner.documents"},
@@ -450,6 +489,9 @@ def system_prompt(cfg: dict) -> str:
     p = cfg["prompt"]
     named = f["named_document_tools"]
     lines: list[str] = ['{% message role="system" %}', p["persona"].strip()]
+    if p["system_description"]:
+        lines.append("# The system and the corpus")
+        lines.append(p["system_description"].strip())
 
     lines.append("# Your tools")
     if f["reference_qa"]:
@@ -511,6 +553,14 @@ def system_prompt(cfg: dict) -> str:
         "- Formulate short, self-contained search queries: the terms the documents themselves use, names and "
         "labels as written. Never paste conversation history into a query. Reformulate and search again if a "
         "first search misses.")
+    voc = cfg["vocabulary"]
+    if voc["synonyms"]:
+        groups = "; ".join(" and ".join(g) for g in voc["synonyms"] if len(g) > 1)
+        lines.append(
+            "- Users write in shorthand; the documents often do not. Your search tools add the other "
+            "forms of these terms automatically, but name the form the documents use when you can: " + groups + ".")
+    if voc["glossary"]:
+        lines.append("- Glossary of the terms users use: " + "; ".join(f"{k} = {v}" for k, v in voc["glossary"].items()) + ".")
     if p["search_vocabulary"]:
         lines.append(p["search_vocabulary"].strip())
     if named:

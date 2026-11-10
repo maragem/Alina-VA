@@ -23,12 +23,12 @@ agent:
 
 store:
   index: EXAMPLE-INDEX
-  embedding_dim: 768
+  embedding_dim: 1024
   extra:
     use_ssl: false
 
 retrieval:
-  embedder_model: intfloat/e5-base-v2
+  embedder_model: intfloat/multilingual-e5-large
   group_by: authority_rank
   subgroup_by: file_id
   sort_docs_by: split_id

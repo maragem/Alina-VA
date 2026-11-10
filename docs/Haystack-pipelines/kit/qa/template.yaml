@@ -1,0 +1,9 @@
+# Curated reference Q&A, read by configs/template.yaml. YAML list, or a CSV with columns
+# question, answer, sources (several sources separated by ';'). Entries are guidance for
+# the agent and are never cited; the agent cites the documents named in `sources`.
+entries:
+- question: "EXAMPLE - replace: how do I do X in SYSTEMNAME?"
+  answer: >-
+    EXAMPLE - replace with the expert answer, short and factual.
+  sources:
+  - Document name, section

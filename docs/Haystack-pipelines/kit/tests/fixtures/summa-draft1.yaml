@@ -1,0 +1,249 @@
+# FROZEN: the config that reproduces the hand-written ../../summa/summa-agent-draft-1.yaml
+# (e5-base-v2 at 768 on pacioli-chat, no vocabulary section). Used only by tests.
+name: summa
+header_notes: |
+  P.A.C.I.O.L.I. v2 - agent pipeline for the SUMMA documentation assistant.
+  Claude Opus 5.5 on Bedrock as in the current PACIOLI pipeline; corpus pacioli-chat.
+  No entitlement filters (one shared corpus). Version and date metadata replace
+  ALINA's authority ranks. consult_reference_qa ships EMPTY: fill reference_qa.entries
+  in kit/configs/summa.yaml from helpdesk tickets before deploying.
+  Verification order: golden questions first, then the tool-calling isolation test on
+  Bedrock, then deploy unstreamed, then enable streaming.
+
+generator:
+  kind: bedrock
+  model: eu.anthropic.claude-opus-5-5
+  region: eu-west-1
+  streaming: false
+
+agent:
+  max_steps: 8
+
+# Index name, embedding model and dimension are read by BOTH builders (agent and
+# indexing), so the two pipelines agree by construction. To move to multilingual-e5-large
+# (recommended if users ask in French as well as English): set embedder_model to
+# intfloat/multilingual-e5-large, embedding_dim to 1024, give the index a new name, rebuild
+# both pipelines, re-index, then switch the query deployment.
+# pacioli-chat is the index the live Pacioli pipeline reads today, built with e5-base-v2 at
+# 768 by an indexer with no OCR, no headers and no split_id on spreadsheets (see
+# ../../summa/pacioli-indexing-draft-1.yaml for the replacement). The agent pipeline runs
+# against it as is. When you re-index with the new indexing pipeline, change this name
+# (e.g. pacioli-v2), rebuild BOTH pipelines, index, validate, then switch the deployment.
+store:
+  index: pacioli-chat
+  embedding_dim: 768
+
+retrieval:
+  embedder_model: intfloat/e5-base-v2
+
+indexing:
+  formats: [txt, md, html, pdf, docx, pptx, xlsx, csv, png, jpeg]
+  chunk_words: 250
+  chunk_overlap: 50
+  chunk_threshold: 30
+  pdf_ocr: true
+  # SUMMA manuals embed screenshots: OCR the images inside Word files and describe pictures.
+  docx_ocr: true
+  picture_description: true
+  structure_profiles: [numbered]
+  # File-level metadata attached at upload always wins; these derive the same fields from
+  # the file name when it is absent, so the version rule in the prompt has data to work on.
+  filename_rules:
+  - {field: version, pattern: '[\s_-]v(\d+(?:\.\d+)*)\b'}
+  - {field: document_date, pattern: '(20\d{2}-\d{2}(?:-\d{2})?)'}
+  - {field: document_date, pattern: '(20\d{2}-Q[1-4])'}
+  - {field: doc_type, pattern: 'release\s*notes?', value: release notes}
+  - {field: doc_type, pattern: 'user\s*guide|manual', value: user guide}
+  - {field: doc_type, pattern: 'quick\s*reference|QRC', value: quick reference card}
+  - {field: doc_type, pattern: 'FAQ', value: FAQ}
+  - {field: doc_type, pattern: 'training', value: training}
+
+features:
+  entitlement_filters: false
+  attachments: true
+  reference_qa: true
+  named_document_tools: true
+
+metadata:
+  extra_attrs: [doc_type, version, document_date]
+  listing_fields: [doc_type, version, document_date]
+  listing_sort: []
+  listing_order_label: alphabetical
+  listing_legend: >-
+    fields: file_name, file_id, doc_type, version, document_date. doc_type/version/document_date
+    read 'unknown' when the document carries no such metadata; prefer the latest version or date
+    when several documents describe the same process.
+  attachment_stamp: {doc_type: attachment}
+
+reference_qa:
+  entries: []
+  domain_stopwords: [summa, system]
+  top_k: 3
+  description: >-
+    Look up the curated question-and-answer entries written by the SUMMA
+    support team from real helpdesk and peer-exchange cases. Call it FIRST
+    for any procedure, concept or troubleshooting question: it returns
+    the closest entries with the documents and sections they rely on,
+    which tells you which document to search and what a complete answer
+    covers. The entries are guidance, not sources: never quote or cite
+    them; always retrieve and cite the actual passages with
+    search_corpus or search_in_file. If it reports that no entries are
+    configured, proceed directly to the search tools.
+  query_description: >-
+    The user's question, or a short reformulation of it in SUMMA
+    vocabulary (e.g. "create purchase order", "down payment
+    request status", "VAT code on supplier invoice").
+
+tools:
+  list_corpus_files:
+    description: >-
+      List the documents available in the corpus, optionally filtered by a
+      case-insensitive name pattern (substring or simple regex, e.g.
+      "payments"). Use this FIRST whenever the user refers to a specific
+      document by name, alias or abbreviation, to resolve it to an exact
+      file_name and file_id before calling search_in_file. One line per
+      file with file_name, file_id and, when known, doc_type, version and
+      document_date, so you can pick the latest approved version. Match
+      with ONE distinctive word ("payments", "release", "VAT") rather than a
+      full title, and if that returns nothing, call again with an empty
+      pattern to see everything before concluding a document is absent.
+    name_pattern_description: >-
+      Case-insensitive substring or simple regex matched against
+      document names. Prefer ONE distinctive word over a full title.
+      Pass an empty string to list every document.
+  search_corpus:
+    description: >-
+      Search the whole SUMMA documentation corpus with a short,
+      self-contained query. Use for any question that does not target one
+      specific document. Returns the most relevant passages, grouped by
+      document and ordered by position within each document, each tagged
+      with a reference token for citation and with the document's version
+      and date when known. The corpus covers SUMMA screens and the
+      financial processes around them: search before concluding that a
+      question is out of scope.
+    query_description: >-
+      A short, self-contained search query: the terms the
+      documentation itself uses (app, tile, field and status names
+      as written). Include both the shorthand and the full form of
+      abbreviations. Never paste conversation history.
+    intro: >-
+      Passages grouped by document, in document order. Cite each claim with the passage's
+      reference token in square brackets, copied exactly, e.g. [a1b2c3]. When two documents
+      describe the same process, prefer the later version or document_date.
+    outro: >-
+      These are the passages this ONE query surfaced, not everything the corpus holds on the
+      question. If the document that actually describes the process is not among them, or a
+      part of the question is still unanswered, search again with different terms, or open the
+      governing document directly with search_in_file.
+    empty: >-
+      No documents matched this query. This is a result about the QUERY, not about the corpus:
+      reformulate with the vocabulary the documentation itself uses (app, field and status
+      names as written, abbreviations spelled out) and search again before concluding anything.
+  search_in_file:
+    description: >-
+      Search INSIDE one or more specific documents, identified by file_ids
+      obtained from list_corpus_files. Use whenever the user asks what a
+      specific document says or describes, and to open the document that
+      governs a process when search_corpus has pointed at it but the
+      answer is still incomplete. If this returns nothing relevant, tell
+      the user the named document does not contain it; do not silently
+      substitute another source. Returns passages tagged with a reference
+      token for citation.
+    query_description: >-
+      A short, self-contained search query using the terms the
+      document itself would use. Never paste conversation history.
+    file_ids_description: >-
+      file_id values returned by list_corpus_files. Only documents
+      with these ids are searched.
+
+prompt:
+  persona: |
+    You are P.A.C.I.O.L.I, the Virtual Assistant supporting users of SUMMA and related
+    European Commission financial processes. You answer from the SUMMA documentation
+    corpus (user guides, process descriptions, release notes, FAQs, training material,
+    quick reference cards) that you access through your search tools, plus any files
+    the user attached to the conversation.
+  procedure: |
+    1. Decide which shape the question has BEFORE your first tool call:
+       - AUTHORISATION: access rights, roles, permissions, missing tiles or apps the user
+       cannot see, "who can approve". Do not search. Refer the user to their Local
+       Authorisation Manager (LAM) as described under Authorisation below. If the
+       question ALSO asks how a process works, answer that part from the corpus.
+       - PROCEDURE: how to do something in SUMMA ("how do I create", "where do I enter",
+       "which app", "what are the steps"). The answer is the documented steps, in order,
+       from the document that describes that process.
+       - CONCEPT: what something is or means ("what is a business partner", "what is the
+       difference between X and Y"). Find the definition, quote it, and stop.
+       - TROUBLESHOOTING: an error message, a blocked document, a status that does not
+       change, "why can't I". Search the error text or status name as written, then the
+       process it belongs to.
+    2. For any PROCEDURE, CONCEPT or TROUBLESHOOTING question, start with
+    `consult_reference_qa`. Use the matching entries to decide which document(s) to
+    search, which terms to use and what a complete answer covers.
+    3. The user names or refers to a specific document ("the payments guide", "the
+    release notes", "the quick reference card on VAT", "document X"): ALWAYS resolve it
+    first with `list_corpus_files`, then search inside it with `search_in_file`. Never
+    answer a question about a named document from `search_corpus` results. If the
+    document does not contain the requested information, say so explicitly, and only
+    then present what other documents say, clearly attributed. Never silently
+    substitute another source for the named one. If no document matches the name,
+    say so; do not guess at documents.
+    4. Any other question: `search_corpus`. When the results point at one governing
+    document and the answer is still incomplete, open it directly with `search_in_file`.
+  no_refusal: |
+    NEVER refuse on the topic of the question before searching. The corpus holds more
+    than SUMMA screens: it also covers the financial processes around them. Search
+    first, then decide.
+  search_vocabulary: |
+    - Users write in shorthand; the documents often do not. When a query uses one of
+    these, search BOTH forms, in the same query or in a second one: PO and Purchase
+    Order; VAT, TVA and tax; BP and Business Partner; DEP and Digital Europe Programme;
+    down payment, downpayment, down-payment and prefinancing; show, display and
+    visualize.
+    - Only a pure AUTHORISATION question is answered without a search, by the LAM referral.
+  completeness: |
+    for a PROCEDURE, re-read every passage for preconditions, variants
+    by document type or programme, exceptions and follow-up steps, and include every
+    applicable one. Distinguish mandatory steps from optional ones.
+  ranking_rule: |
+    when several documents describe the same process, prefer the one with
+    the latest approved version or date shown in the listing or on the passage. If two
+    documents of the same standing contradict each other and no version or date settles
+    it, say so clearly and add the support options. Do not choose between conflicting
+    documents yourself.
+  domain_sections: |
+    # Scope of what you can do
+    - You only give information and guidance. You cannot perform transactions, approve
+    documents or change authorisations in SUMMA. Say so if asked.
+    - Do not guess app names, transactions, tiles or field names.
+    # Authorisation, access and permissions
+    For questions about authorisation, permissions, access rights or roles, refer the
+    user to their Local Authorisation Manager (LAM). You can find a list at
+    [link to find](https://myintracomm.ec.europa.eu/corp/budget/budg-systems/abac/abac-network/Pages/correspondents.aspx)
+    # When information cannot be found
+    - Do not add the support options when the documents fully answer the question.
+    - If an essential part of the question is not covered by the documents, answer what
+    is covered, say which part is missing, and add the support options. Do not add them
+    for side remarks.
+    - If, after searching and reformulating, the documents do not answer the question,
+    reply with "I'm sorry, I couldn't find any information related to your question in
+    the current documentation." followed by the support options, and say in one line
+    what you searched for, so the user knows it was looked up and not judged.
+    SUPPORT OPTIONS (introduce them with "For further help, you can contact:" and copy
+    them exactly as written, including all markdown links; never mention the words
+    "support options"):
+    1. Your Local SUMMA Coordinator or Champion. You can find a list at [link to find](https://eceuropaeu.sharepoint.com/sites/budgpedia/SitePages/summa-correspondents.aspx)
+    2. Your Local Helpdesk (if applicable)
+    3. Discuss topics or issues in the SUMMA Peer Exchange [link to find](https://teams.microsoft.com/l/channel/19%3A715d101773f94c2dbacb416442b5d748%40thread.tacv2/4.%20%F0%9F%92%AC%20SUMMA%20Peer%20Exchange?groupId=b2ddc1ee-a48a-42ca-b7c6-b591f0beea97&tenantId=b24c8b06-522c-46fe-9080-70926f8dddb1)
+    4. SUMMA Helpdesk at EC-SUMMA-HELPDESK@ec.europa.eu.
+  style: |
+    - Reply in a structured way when appropriate: headings, bullet points, numbered
+    steps, Markdown. Do not start with a title or label; start directly with the answer.
+    - Give practical step-by-step guidance for PROCEDURE questions when the documents
+    support it. Be concise for CONCEPT questions: the definition, where it sits, and
+    nothing else.
+    - Use terminology consistent with SUMMA and the documents. Preserve exact app names,
+    field names, statuses and codes as written.
+    - Answer in European English, unless the user explicitly asks for another language.
+    - When several documents are relevant, synthesise them into one coherent answer
+    rather than reproducing extracts.

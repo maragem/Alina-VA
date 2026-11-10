@@ -1,13 +1,13 @@
-# SUMMA documentation assistant (P.A.C.I.O.L.I. v2). Builds the same pipeline as
-# ../../summa/summa-agent-draft-1.yaml (which was written by hand before the kit
-# existed); tests/test_build.py asserts the two are structurally identical.
+# SUMMA documentation assistant (P.A.C.I.O.L.I.). One config, two builds:
+#   python build_pipeline.py configs/summa.yaml -o ../summa/generated/summa-agent.yaml --check
+#   python build_indexing.py configs/summa.yaml -o ../summa/generated/pacioli-indexing.yaml --check
 name: summa
 header_notes: |
-  P.A.C.I.O.L.I. v2 - agent pipeline for the SUMMA documentation assistant.
-  Claude Opus 5.5 on Bedrock as in the current PACIOLI pipeline; corpus pacioli-chat.
-  No entitlement filters (one shared corpus). Version and date metadata replace
-  ALINA's authority ranks. consult_reference_qa ships EMPTY: fill reference_qa.entries
-  in kit/configs/summa.yaml from helpdesk tickets before deploying.
+  P.A.C.I.O.L.I. - agent pipeline for the SUMMA documentation assistant.
+  Claude Opus 5.5 on Bedrock as in the current Pacioli pipeline. multilingual-e5-large at
+  1024 dims, matching the Docling-based Pacioli indexer. No entitlement filters (one shared
+  corpus). Version and date metadata replace ALINA's authority ranks.
+  consult_reference_qa reads kit/qa/summa.yaml: fill it from helpdesk tickets before deploying.
   Verification order: golden questions first, then the tool-calling isolation test on
   Bedrock, then deploy unstreamed, then enable streaming.
 
@@ -20,22 +20,17 @@ generator:
 agent:
   max_steps: 8
 
-# Index name, embedding model and dimension are read by BOTH builders (agent and
-# indexing), so the two pipelines agree by construction. To move to multilingual-e5-large
-# (recommended if users ask in French as well as English): set embedder_model to
-# intfloat/multilingual-e5-large, embedding_dim to 1024, give the index a new name, rebuild
-# both pipelines, re-index, then switch the query deployment.
-# pacioli-chat is the index the live Pacioli pipeline reads today, built with e5-base-v2 at
-# 768 by an indexer with no OCR, no headers and no split_id on spreadsheets (see
-# ../../summa/pacioli-indexing-draft-1.yaml for the replacement). The agent pipeline runs
-# against it as is. When you re-index with the new indexing pipeline, change this name
-# (e.g. pacioli-v2), rebuild BOTH pipelines, index, validate, then switch the deployment.
+# The index the Docling-based Pacioli indexer (multilingual-e5-large, 1024) writes to.
+# REPLACE pacioli-docling with that index's real name, shown in deepset Studio > Indexes;
+# the pasted indexer had no explicit name on its writer. When re-indexing with the kit's
+# indexing pipeline, give the new index a new name here, rebuild BOTH pipelines, index,
+# validate, then switch the deployment.
 store:
-  index: pacioli-chat
-  embedding_dim: 768
+  index: pacioli-docling
+  embedding_dim: 1024
 
 retrieval:
-  embedder_model: intfloat/e5-base-v2
+  embedder_model: intfloat/multilingual-e5-large
 
 indexing:
   formats: [txt, md, html, pdf, docx, pptx, xlsx, csv, png, jpeg]
@@ -76,8 +71,25 @@ metadata:
     when several documents describe the same process.
   attachment_stamp: {doc_type: attachment}
 
+# Vocabulary: the synonym groups drive a deterministic query expander inside both search
+# tools (the first form is the one users write, the others are what the documents say) and
+# a prompt section; the glossary is rendered in the prompt only.
+vocabulary:
+  synonyms:
+  - [PO, Purchase Order]
+  - [VAT, TVA, tax]
+  - [BP, Business Partner]
+  - [DEP, Digital Europe Programme]
+  - [down payment, downpayment, down-payment, prefinancing]
+  - [show, display, visualize]
+  - [LAM, Local Authorisation Manager]
+  glossary:
+    SUMMA: the European Commission's corporate system for managing contracts, commitments, invoices and payments
+    LAM: the Local Authorisation Manager who grants SUMMA roles and access rights in a DG
+    BP: a Business Partner, i.e. a supplier, beneficiary or other counterparty record
+
 reference_qa:
-  entries: []
+  entries_file: ../qa/summa.yaml
   domain_stopwords: [summa, system]
   top_k: 3
   description: >-
@@ -125,8 +137,7 @@ tools:
     query_description: >-
       A short, self-contained search query: the terms the
       documentation itself uses (app, tile, field and status names
-      as written). Include both the shorthand and the full form of
-      abbreviations. Never paste conversation history.
+      as written). Never paste conversation history.
     intro: >-
       Passages grouped by document, in document order. Cite each claim with the passage's
       reference token in square brackets, copied exactly, e.g. [a1b2c3]. When two documents
@@ -139,7 +150,7 @@ tools:
     empty: >-
       No documents matched this query. This is a result about the QUERY, not about the corpus:
       reformulate with the vocabulary the documentation itself uses (app, field and status
-      names as written, abbreviations spelled out) and search again before concluding anything.
+      names as written) and search again before concluding anything.
   search_in_file:
     description: >-
       Search INSIDE one or more specific documents, identified by file_ids
@@ -161,9 +172,15 @@ prompt:
   persona: |
     You are P.A.C.I.O.L.I, the Virtual Assistant supporting users of SUMMA and related
     European Commission financial processes. You answer from the SUMMA documentation
-    corpus (user guides, process descriptions, release notes, FAQs, training material,
-    quick reference cards) that you access through your search tools, plus any files
-    the user attached to the conversation.
+    corpus that you access through your search tools, plus any files the user attached
+    to the conversation.
+  system_description: |
+    SUMMA is the European Commission's corporate financial system for managing contracts,
+    commitments, invoices and payments, built on SAP S/4HANA and used by every DG. Users
+    work in Fiori apps (tiles) and refer to them by app name, transaction or tile. The
+    corpus holds the user guides and process descriptions per module, release notes per
+    release, FAQs, quick reference cards and training material. Release notes supersede
+    older guides on the points they change.
   procedure: |
     1. Decide which shape the question has BEFORE your first tool call:
        - AUTHORISATION: access rights, roles, permissions, missing tiles or apps the user
@@ -196,11 +213,6 @@ prompt:
     than SUMMA screens: it also covers the financial processes around them. Search
     first, then decide.
   search_vocabulary: |
-    - Users write in shorthand; the documents often do not. When a query uses one of
-    these, search BOTH forms, in the same query or in a second one: PO and Purchase
-    Order; VAT, TVA and tax; BP and Business Partner; DEP and Digital Europe Programme;
-    down payment, downpayment, down-payment and prefinancing; show, display and
-    visualize.
     - Only a pure AUTHORISATION question is answered without a search, by the LAM referral.
   completeness: |
     for a PROCEDURE, re-read every passage for preconditions, variants
