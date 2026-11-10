@@ -8,12 +8,18 @@ between use cases is a short config. The build is deterministic and checked.
 ```
 kit/
   README.md              this file: architecture, decision guide, how to adopt
-  build_pipeline.py      config -> deepset pipeline YAML
+  build_pipeline.py      config -> agent (query) pipeline YAML
+  build_indexing.py      the SAME config -> indexing pipeline YAML
   components/*.py        the Code components, as importable, unit-tested Python
   configs/*.yaml         one per use case (summa, procurement-authority, minimal)
-  checks/verify_pipeline.py   structural checks for any built pipeline
-  tests/                 pytest: components against real haystack classes, builds, equality with the hand-written SUMMA draft
+  checks/verify_pipeline.py   structural checks for any built agent pipeline
+  checks/verify_indexing.py   structural checks for an indexing pipeline + agreement with the config
+  tests/                 pytest: components, builds, verifiers, equality with the hand-written SUMMA draft
 ```
+
+One config drives both pipelines. The index name, the embedding model and the embedding
+dimension are written once and read by both builders, so the query side and the index can
+never disagree, which is the first thing that went wrong in the Pacioli pipelines.
 
 Requirements for building and testing: `pip install haystack-ai pyyaml pytest`. No deepset
 workspace, OpenSearch or model access is needed until deployment.
@@ -146,6 +152,42 @@ ALINA 9k averages 37 seconds per answer against a few seconds for a fixed chain.
 7. **Iterate from traces, not hunches.** Fixtures for new tests come from a trace. After any
    change: `pytest tests` and the build with `--check`.
 
+## 4b. Indexing: what the agent pipeline needs from the index
+
+`build_indexing.py` produces the indexing pipeline from the same config. Its shape is
+ALINA's indexing-v06, generalised:
+
+```
+files -> file_classifier -> one converter per format
+   md, html, pdf, docx, doc, odt, png, jpeg -> structure_promoter -> document_cleaner -> MarkdownHeaderSplitter ─┐
+   txt, pptx                                -> splitter ──────────────────────────────────────────────────────────┤
+   xlsx, csv                                -> table_splitter ────────────────────────────────────────────────────┤
+                                                                              split_joiner <────────────────────┘
+                                                              -> metadata_finalizer -> document_embedder -> writer
+```
+
+Formats: `txt md html pdf docx pptx xlsx csv png jpeg doc odt`, chosen per config. PDF,
+DOCX and images go through Docling (OCR, table structure, optional picture description,
+always on for images); `.doc` and `.odt` through Kreuzberg. Each rule below is enforced
+by `checks/verify_indexing.py`, and each one was a real failure in ALINA or Pacioli.
+
+| Rule | Why |
+|---|---|
+| Same index name, embedding model and dimension on both sides | A 768-dimension query vector cannot search a 1024-dimension field. The Pacioli indexer embedded with multilingual-e5-large at 1024 while its query pipeline embedded with e5-base-v2 at 768. The config has one value for each; both builders read it. |
+| Name the index explicitly on the writer | Without `index`, deepset writes to the workspace default and nothing proves the query pipeline reads the same index. |
+| e5 models get `passage: ` on documents and `query: ` on queries | The e5 family is trained with these prefixes; without them dense scores degrade across the board. Derived from the model name in one function used by both builders. |
+| Every format passes through a splitter | The file listing enumerates files by `split_id == 0`, and the sentence window walks `split_id`. A converter wired straight into the embedder (Pacioli's XLSX, CSV and images) produces chunks with no `split_id`: invisible to `list_corpus_files`, and one oversized chunk per sheet. |
+| Chunks of at most 300 words, default 250 with 50 overlap | e5 models truncate at 512 tokens. At 512 words the second half of every chunk is never embedded. |
+| `split_threshold` above 0 on the header splitter | A threshold of 0 emits header-only fragments, which are retrieval noise the reranker latches onto. |
+| Structure promoter before the cleaner, page sentinel in the header splitter | The cleaner's whitespace collapsing swallows form feeds, so page numbers all become 1. The promoter swaps the form feed for a printable sentinel, the splitter counts it, the finalizer strips it. |
+| Headers promoted from visual structure | Docling does not emit headings for visually formatted titles; the header splitter then has nothing to cut on and every chunk inherits one header. Profiles: `numbered` for manuals and guidance, `legal`, `contract` and `judgment` for law. Detection per document keeps paragraph numbering from being promoted. |
+| `header` composed as `<file_name> | <section>` and embedded with the chunk | It is the label in the sources panel, the field the rerankers embed, and the context a mid-section chunk carries in its own vector. |
+| Ranking or version metadata present on every chunk | File-level metadata attached at upload propagates to every chunk and always wins. `indexing.filename_rules` derive `version`, `document_date` and `doc_type` from the file name as a fallback. `indexing.meta_defaults` gives the field the agent groups on a value, so unranked files sort last instead of forming a null group. |
+| Re-index after any change, under a new index name | Index-time metadata never applies retroactively. A new name keeps the old index queryable until the new one is validated; bump the config and rebuild both pipelines. |
+
+Changing the embedding model is therefore two config lines plus a new index name:
+`retrieval.embedder_model` and `store.embedding_dim`. The tests include that switch.
+
 ## 5. Checks and tests
 
 - `checks/verify_pipeline.py <pipeline.yaml> [config.yaml]`: structural checks on any
@@ -160,6 +202,12 @@ ALINA 9k averages 37 seconds per answer against a few seconds for a fixed chain.
   verifier, and its prompts render through Haystack's `ChatPromptBuilder`. The SUMMA build
   is asserted structurally identical to the hand-written `../summa/summa-agent-draft-1.yaml`
   (everything except code bodies and prompt wording).
+- `checks/verify_indexing.py <indexing.yaml> <config.yaml>`: the indexing rules of section
+  4b, plus agreement with the config: index, dimension, model, prefixes, and a note when the
+  agent shows a metadata field nothing derives.
+- `tests/test_indexing.py`: structure promoter and metadata finalizer against real haystack
+  classes, every config's indexing build, agreement between the indexing and agent builds
+  of one config, and the embedding-model switch changing both sides.
 
 ## 6. Known limits of this version
 
@@ -168,7 +216,8 @@ ALINA 9k averages 37 seconds per answer against a few seconds for a fixed chain.
   are domain-specific and not in the kit. Add them as a feature if a second use case needs them.
 - Bedrock and OpenAI-compatible generators only. Other Haystack chat generators can be
   added in `chat_generator()`.
-- The attachment converter is PACIOLI's (pdfminer, docx, pptx, xlsx, csv). For scanned
-  PDFs or `.doc`/`.odt` attachments, add Docling or Kreuzberg converters as in `../indexing-v06.yaml`.
+- The attachment converter in the agent pipeline is PACIOLI's (pdfminer, docx, pptx, xlsx,
+  csv), lighter than the indexing converters on purpose: it runs on every turn that carries
+  a file. For scanned PDFs or `.doc`/`.odt` attachments, reuse the indexing converters.
 - Comments inside the generated YAML are limited to the header; the reasoning lives here
   and in `components/*.py`.

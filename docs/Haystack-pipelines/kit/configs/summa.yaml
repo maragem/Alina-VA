@@ -20,9 +20,39 @@ generator:
 agent:
   max_steps: 8
 
+# Index name, embedding model and dimension are read by BOTH builders (agent and
+# indexing), so the two pipelines agree by construction. To move to multilingual-e5-large
+# (recommended if users ask in French as well as English): set embedder_model to
+# intfloat/multilingual-e5-large, embedding_dim to 1024, give the index a new name, rebuild
+# both pipelines, re-index, then switch the query deployment.
 store:
   index: pacioli-index
   embedding_dim: 768
+
+retrieval:
+  embedder_model: intfloat/e5-base-v2
+
+indexing:
+  formats: [txt, md, html, pdf, docx, pptx, xlsx, csv, png, jpeg]
+  chunk_words: 250
+  chunk_overlap: 50
+  chunk_threshold: 30
+  pdf_ocr: true
+  # SUMMA manuals embed screenshots: OCR the images inside Word files and describe pictures.
+  docx_ocr: true
+  picture_description: true
+  structure_profiles: [numbered]
+  # File-level metadata attached at upload always wins; these derive the same fields from
+  # the file name when it is absent, so the version rule in the prompt has data to work on.
+  filename_rules:
+  - {field: version, pattern: '[\s_-]v(\d+(?:\.\d+)*)\b'}
+  - {field: document_date, pattern: '(20\d{2}-\d{2}(?:-\d{2})?)'}
+  - {field: document_date, pattern: '(20\d{2}-Q[1-4])'}
+  - {field: doc_type, pattern: 'release\s*notes?', value: release notes}
+  - {field: doc_type, pattern: 'user\s*guide|manual', value: user guide}
+  - {field: doc_type, pattern: 'quick\s*reference|QRC', value: quick reference card}
+  - {field: doc_type, pattern: 'FAQ', value: FAQ}
+  - {field: doc_type, pattern: 'training', value: training}
 
 features:
   entitlement_filters: false

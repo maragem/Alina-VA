@@ -28,9 +28,18 @@ store:
     use_ssl: false
 
 retrieval:
+  embedder_model: intfloat/e5-base-v2
   group_by: authority_rank
   subgroup_by: file_id
   sort_docs_by: split_id
+
+indexing:
+  # .doc and .odt are common in older EC document sets; Kreuzberg converts them.
+  formats: [txt, md, html, pdf, docx, doc, odt, pptx, xlsx, csv]
+  structure_profiles: [legal, judgment, numbered, contract]
+  # authority_rank is attached at upload (see ALINA's docs/authority-metadata.json); files
+  # without one must still sort, below everything else, because the agent groups on it.
+  meta_defaults: {authority_rank: 5}
 
 features:
   entitlement_filters: true
