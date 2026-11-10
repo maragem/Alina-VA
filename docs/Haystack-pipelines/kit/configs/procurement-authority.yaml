@@ -1,0 +1,90 @@
+# Example: an ALINA-shaped use case. Per-user entitlement filters ON, passages and
+# listings ranked by an authority_rank metadata field, an OpenAI-compatible gateway
+# as the generator. This is NOT the deployed ALINA 9k (which carries a domain-specific
+# second retrieval layer and a lookup/practical question-shape parameter); it shows
+# how the kit expresses that family of requirements.
+name: procurement-authority
+header_notes: |
+  Example build: entitlement filters on, authority ranking, OpenAI-compatible gateway.
+  SECURITY GATE before any deployment: ask a question as a user scoped to one project
+  and confirm in the trace that every retriever inside the tools received the
+  entitlement filters and that list_corpus_files with an empty pattern shows only the
+  entitled files. If filters arrive as None the whole corpus is exposed, silently.
+
+generator:
+  kind: openai
+  model: gpt-5.1
+  api_base_url: https://api.tech.ec.europa.eu/ecgpt/v1
+  api_key_env: GPTEC_API_KEY
+  streaming: false
+
+agent:
+  max_steps: 10
+
+store:
+  index: EXAMPLE-INDEX
+  embedding_dim: 768
+  extra:
+    use_ssl: false
+
+retrieval:
+  group_by: authority_rank
+  subgroup_by: file_id
+  sort_docs_by: split_id
+
+features:
+  entitlement_filters: true
+  attachments: true
+  reference_qa: true
+  named_document_tools: true
+
+metadata:
+  extra_attrs: [authority_rank]
+  listing_fields: [authority_rank]
+  listing_sort: [authority_rank]
+  listing_order_label: highest authority first
+  listing_legend: >-
+    authority_rank: 1 = legal acts, 2 = internal rules and circulars, 3 = guidance,
+    4 = tender and contract documents, 5 = Q&A logs and correspondence; unknown sorts last.
+  attachment_stamp: {authority_rank: 0}
+
+reference_qa:
+  entries:
+  - question: "Example entry: what is a framework contract?"
+    answer: "Replace with the expert answer. Entries are guidance for the agent, never cited."
+    sources: ["Financial Regulation, Annex I, point 1.3"]
+  domain_stopwords: [procurement]
+
+tools:
+  search_corpus:
+    intro: >-
+      Passages grouped by authority rank (earlier = higher authority). Cite each claim with the
+      passage's reference token in square brackets, copied exactly, e.g. [a1b2c3].
+
+prompt:
+  persona: |
+    You are the AI assistant of a procurement unit: a source-grounded assistant for
+    procurement and contract intelligence. You answer strictly from a curated corpus of
+    procurement documents (legal acts, internal rules, guidance, tender documents, Q&A
+    logs) that you access through your search tools, plus any files the user attached.
+  ranking_rule: |
+    when several documents state the same rule, answer from the highest-authority source:
+    legal acts above internal rules and circulars, above guidance, above tender
+    specifications, above Q&A logs and correspondence. The authority_rank is shown on
+    every listing line and passage. Cite the exact section that answers, not a neighbour.
+  completeness: |
+    after finding the general rule, re-read every passage for exceptions, derogations,
+    extensions, thresholds and special cases ("unless", "except", "however", "may be
+    extended", "by way of derogation") and include every applicable one. Distinguish
+    mandatory from discretionary.
+  domain_sections: |
+    # Boundaries
+    - You provide information grounded in the documents; you do not give legal advice,
+    make procurement decisions, or issue binding interpretations. Where judgement beyond
+    the text is needed, state what the documents say and note the decision rests with the
+    responsible officer.
+  style: |
+    - Professional, precise, neutral, suited to an EU institutional context. Markdown.
+    - The first paragraph must contain the complete direct answer; supporting quotes and
+    detail follow. Then a final "Sources" list of the distinct instruments relied on.
+    - Always answer in English.

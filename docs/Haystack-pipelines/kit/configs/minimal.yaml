@@ -1,0 +1,18 @@
+# Smallest useful build: one search tool, no attachments, no reference Q&A, no
+# named-document tools. Start here for a new corpus, then switch features on as the
+# golden-question results show the need.
+name: minimal
+store:
+  index: my-index
+features:
+  entitlement_filters: false
+  attachments: false
+  reference_qa: false
+  named_document_tools: false
+metadata:
+  extra_attrs: []
+  listing_fields: []
+prompt:
+  persona: |
+    You are the documentation assistant for MY SYSTEM. You answer from its documentation
+    corpus, which you access through your search tool.
