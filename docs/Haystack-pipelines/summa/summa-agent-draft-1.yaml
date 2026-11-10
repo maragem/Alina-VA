@@ -6,7 +6,7 @@
 # WHAT THIS IS
 #   The ALINA 9k agent skeleton (one haystack Agent, PipelineTools wrapping the
 #   retrieval chain, token-based citations, history sanitizer, citation renumberer)
-#   re-targeted at the SUMMA corpus (`pacioli-index`), the PACIOLI persona and
+#   re-targeted at the SUMMA corpus (`pacioli-chat`), the PACIOLI persona and
 #   prompt rules, and Claude Opus 5.5 on Amazon Bedrock as in the current PACIOLI
 #   pipeline. The current PACIOLI pipeline is a fixed chain: rewrite -> hybrid
 #   retrieval -> rerank -> answer. This draft replaces it with an agent that decides
@@ -831,7 +831,7 @@ components:
                 # RULE (ALINA draft 3): every document store must be DECLARED IN YAML as
                 # an init_parameter of a real component; deepset injects the cluster host
                 # and credentials through its from_dict hook. Never build one in Python.
-                # The static filter enumerates one chunk per file. VERIFY on pacioli-index
+                # The static filter enumerates one chunk per file. VERIFY on pacioli-chat
                 # that split_id restarts at 0 for every file; if the index does not carry
                 # split_id, drop the filter and accept the 10 000-chunk cap for now.
                 type: haystack.components.retrievers.filter_retriever.FilterRetriever
@@ -840,7 +840,7 @@ components:
                     type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
                     init_parameters:
                       embedding_dim: 768
-                      index: pacioli-index
+                      index: pacioli-chat
                   filters:
                     field: split_id
                     operator: ==
@@ -855,7 +855,7 @@ components:
                     type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
                     init_parameters:
                       embedding_dim: 768
-                      index: pacioli-index
+                      index: pacioli-chat
                   top_k: 500
                   fuzziness: AUTO
               lister:
@@ -1039,7 +1039,7 @@ components:
                     type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
                     init_parameters:
                       embedding_dim: 768
-                      index: pacioli-index
+                      index: pacioli-chat
                   top_k: 30
                   fuzziness: 0
               query_embedder:
@@ -1056,7 +1056,7 @@ components:
                     type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
                     init_parameters:
                       embedding_dim: 768
-                      index: pacioli-index
+                      index: pacioli-chat
                   top_k: 30
               document_joiner:
                 type: haystack.components.joiners.document_joiner.DocumentJoiner
@@ -1084,7 +1084,7 @@ components:
                     type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
                     init_parameters:
                       embedding_dim: 768
-                      index: pacioli-index
+                      index: pacioli-chat
                   window_size: 1
                   source_id_meta_field: file_id
                   split_id_meta_field: split_id
@@ -1261,7 +1261,7 @@ components:
                 # Builds the file_id constraint for both retrievers. Field spelling
                 # "file_id" is what ALINA runs in production against a deepset OpenSearch
                 # index; the integration prefixes bare meta fields itself. VERIFY once on
-                # pacioli-index with a known file_id.
+                # pacioli-chat with a known file_id.
                 type: deepset_cloud_custom_nodes.code.code_component.Code
                 init_parameters:
                   code: |
@@ -1292,7 +1292,7 @@ components:
                     type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
                     init_parameters:
                       embedding_dim: 768
-                      index: pacioli-index
+                      index: pacioli-chat
                   top_k: 30
                   fuzziness: 0
               query_embedder:
@@ -1309,7 +1309,7 @@ components:
                     type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
                     init_parameters:
                       embedding_dim: 768
-                      index: pacioli-index
+                      index: pacioli-chat
                   top_k: 30
               document_joiner:
                 type: haystack.components.joiners.document_joiner.DocumentJoiner
@@ -1332,7 +1332,7 @@ components:
                     type: haystack_integrations.document_stores.opensearch.document_store.OpenSearchDocumentStore
                     init_parameters:
                       embedding_dim: 768
-                      index: pacioli-index
+                      index: pacioli-chat
                   window_size: 1
                   source_id_meta_field: file_id
                   split_id_meta_field: split_id

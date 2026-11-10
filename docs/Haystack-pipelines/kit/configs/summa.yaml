@@ -4,7 +4,7 @@
 name: summa
 header_notes: |
   P.A.C.I.O.L.I. v2 - agent pipeline for the SUMMA documentation assistant.
-  Claude Opus 5.5 on Bedrock as in the current PACIOLI pipeline; corpus pacioli-index.
+  Claude Opus 5.5 on Bedrock as in the current PACIOLI pipeline; corpus pacioli-chat.
   No entitlement filters (one shared corpus). Version and date metadata replace
   ALINA's authority ranks. consult_reference_qa ships EMPTY: fill reference_qa.entries
   in kit/configs/summa.yaml from helpdesk tickets before deploying.
@@ -25,8 +25,13 @@ agent:
 # (recommended if users ask in French as well as English): set embedder_model to
 # intfloat/multilingual-e5-large, embedding_dim to 1024, give the index a new name, rebuild
 # both pipelines, re-index, then switch the query deployment.
+# pacioli-chat is the index the live Pacioli pipeline reads today, built with e5-base-v2 at
+# 768 by an indexer with no OCR, no headers and no split_id on spreadsheets (see
+# ../../summa/pacioli-indexing-draft-1.yaml for the replacement). The agent pipeline runs
+# against it as is. When you re-index with the new indexing pipeline, change this name
+# (e.g. pacioli-v2), rebuild BOTH pipelines, index, validate, then switch the deployment.
 store:
-  index: pacioli-index
+  index: pacioli-chat
   embedding_dim: 768
 
 retrieval:

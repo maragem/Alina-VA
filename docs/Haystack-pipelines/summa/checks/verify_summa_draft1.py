@@ -110,7 +110,7 @@ chk("outputs_to_state" not in tools["list_corpus_files"], "list_corpus_files nev
 print("\n=== SUMMA re-targeting ===")
 dump = yaml.safe_dump(Y)
 chk("ALINA-V0.3" not in dump and "ALINA-V0.4" not in dump, "no ALINA index left")
-chk(dump.count("index: pacioli-index") == 8, "pacioli-index on all 8 store declarations")
+chk(dump.count("index: pacioli-chat") == 8, "pacioli-chat on all 8 store declarations")
 chk("authority_rank" not in dump, "no authority_rank anywhere")
 chk("4abf8796" not in dump, "no Financial Regulation file_id")
 chk("guidance_bm25" not in dump and "question_shape" not in dump, "no implementing-guidance layer")
