@@ -1,5 +1,8 @@
 # SUMMA / P.A.C.I.O.L.I. pipelines
 
+Start with `PROPOSAL.md`: the main pipeline, the four tool sub-pipelines, the indexing
+pipeline, what to fill in and the deployment order.
+
 - `summa-agent-draft-1.yaml`: the first agent pipeline, written by hand before the kit
   existed, against the live index `pacioli-chat` (e5-base-v2, 768). Kept as shared with the
   SUMMA developer; `checks/` are its own offline checks. Frozen.
@@ -10,7 +13,7 @@
 
 ```
 cd ../kit
-python build_pipeline.py configs/summa.yaml -o ../summa/generated/summa-agent.yaml --check
+python build_pipeline.py configs/summa.yaml -o ../summa/generated/summa-agent.yaml --tools-dir ../summa/generated/tools --check
 python build_indexing.py configs/summa.yaml -o ../summa/generated/pacioli-indexing.yaml --check
 ```
 

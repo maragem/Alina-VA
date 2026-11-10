@@ -163,6 +163,7 @@ ALINA 9k averages 37 seconds per answer against a few seconds for a fixed chain.
    working build), set the index, the persona and the system description, build with `--check`:
    ```
    python build_pipeline.py configs/<name>.yaml -o <out>.yaml --check
+   python build_pipeline.py configs/<name>.yaml -o <out>.yaml --tools-dir <dir> --check   # also one review file per tool
    ```
 3. **Isolation test on the generator.** A throwaway pipeline with the same chat generator
    and one trivial tool, no streaming. In the trace, a `tool_invoker` span under about 20

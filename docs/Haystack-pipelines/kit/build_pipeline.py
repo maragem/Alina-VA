@@ -761,6 +761,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("config")
     ap.add_argument("-o", "--output", help="output YAML path (default: stdout)")
     ap.add_argument("--check", action="store_true", help="run checks/verify_pipeline on the result")
+    ap.add_argument("--tools-dir", help="also write each tool's sub-pipeline to <dir>/<tool>.yaml, for review")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     pipeline = build(cfg)
@@ -770,6 +771,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"wrote {args.output} ({len(text.splitlines())} lines)")
     else:
         sys.stdout.write(text)
+    if args.tools_dir:
+        out_dir = Path(args.tools_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for tool in pipeline["components"]["agent"]["init_parameters"]["tools"]:
+            data = tool["data"]
+            note = (f"REVIEW VIEW of the tool `{data['name']}`. This sub-pipeline is EMBEDDED in the agent "
+                    f"pipeline as a haystack PipelineTool; it is not deployed on its own. The model sees only "
+                    f"`description` and `parameters`; `input_mapping` wires the model's arguments (and state-fed "
+                    f"values) to the components below; `outputs_to_string` is what the model reads back.")
+            body = to_yaml(data, {**cfg, "header_notes": "\n".join(__import__("textwrap").wrap(note, 88))}, args.config)
+            (out_dir / f"{data['name']}.yaml").write_text(body, encoding="utf-8")
+        print(f"wrote {len(pipeline['components']['agent']['init_parameters']['tools'])} tool views to {out_dir}")
     if args.check:
         sys.path.insert(0, str(KIT_DIR / "checks"))
         from verify_pipeline import verify  # noqa: E402
