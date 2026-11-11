@@ -67,7 +67,10 @@ def test_qa_entries_file_yaml_and_csv(tmp_path):
     assert [e["question"] for e in cfg["reference_qa"]["entries"]] == ["Inline?", "Q?"]
     p = build(cfg)
     code = [t for t in p["components"]["agent"]["init_parameters"]["tools"] if t["data"]["name"] == "consult_reference_qa"][0]
-    assert "'question': 'Q?'" in code["data"]["pipeline"]["components"]["qa_lookup"]["init_parameters"]["code"]
+    ns = {}
+    exec(code["data"]["pipeline"]["components"]["qa_lookup"]["init_parameters"]["code"], ns)
+    assert [e["question"] for e in ns["QA_ENTRIES"]] == ["Inline?", "Q?"]
+    assert "Reference entry 1: Inline?" in ns["ReferenceQALookup"]().run(query="inline question")["result"]
 
 
 def test_summa_qa_file_is_read_and_currently_empty():

@@ -64,8 +64,11 @@ def test_feature_flags_shape_the_pipeline():
     grp = tools["search_corpus"]["pipeline"]["components"]["meta_field_grouping_ranker"]["init_parameters"]
     assert grp == {"group_by": "authority_rank", "subgroup_by": "file_id", "sort_docs_by": "split_id"}
     qa_code = tools["consult_reference_qa"]["pipeline"]["components"]["qa_lookup"]["init_parameters"]["code"]
-    assert "Can a framework contract run for longer than four years?" in qa_code
-    assert len(cfg["reference_qa"]["entries"]) == 34
+    ns = {}
+    exec(qa_code, ns)
+    assert ns["QA_ENTRIES"][0]["question"] == "Can a framework contract run for longer than four years?"
+    assert len(ns["QA_ENTRIES"]) == 34 and len(cfg["reference_qa"]["entries"]) == 34
+    assert qa_code.isascii(), "entries are packed so expert text cannot put non-ASCII into the YAML"
 
 
 def _strip(node, drop=("code", "system_prompt")):

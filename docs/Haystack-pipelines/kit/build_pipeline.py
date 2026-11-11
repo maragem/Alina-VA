@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import re
 import sys
 from pathlib import Path
@@ -145,6 +146,22 @@ def load_qa_entries(path: Path) -> list[dict]:
 _KIT_LINE = re.compile(r"^(?P<indent>\s*)(?P<name>\w+) = .*  # KIT:(?P<key>\w+)\s*$")
 
 
+class Raw(str):
+    """A substitution value inserted verbatim as Python source instead of via repr()."""
+
+
+def packed_literal(value: Any) -> Raw:
+    """Python source that rebuilds `value` from a zlib+base64 blob. Used for large or
+    typographically rich data (the Q&A entries): the YAML stays ASCII and compact, and
+    quotes, dashes and newlines in expert text cannot break the editor or the code."""
+    import base64
+    import zlib
+    blob = base64.b64encode(zlib.compress(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 9)).decode("ascii")
+    chunks = [blob[i:i + 96] for i in range(0, len(blob), 96)]
+    body = "\n".join(f'    "{c}"' for c in chunks)
+    return Raw(f'json.loads(zlib.decompress(base64.b64decode("".join((\n{body}\n)))).decode("utf-8"))')
+
+
 def component_code(module: str, values: dict[str, Any] | None = None) -> str:
     """Reads components/<module>.py and substitutes the `# KIT:` tagged constants."""
     values = values or {}
@@ -152,7 +169,9 @@ def component_code(module: str, values: dict[str, Any] | None = None) -> str:
     for line in (COMPONENTS_DIR / f"{module}.py").read_text(encoding="utf-8").splitlines():
         m = _KIT_LINE.match(line)
         if m and m.group("key") in values:
-            line = f"{m.group('indent')}{m.group('name')} = {values[m.group('key')]!r}"
+            value = values[m.group("key")]
+            rendered = str(value) if isinstance(value, Raw) else repr(value)
+            line = f"{m.group('indent')}{m.group('name')} = {rendered}"
         elif m:
             line = line[: line.rindex("  # KIT:")]
         out.append(line)
@@ -476,7 +495,7 @@ def tool_reference_qa(cfg: dict) -> dict:
         "output_mapping": {"qa_lookup.result": "result"},
         "outputs_to_string": {"source": "result"},
         "pipeline": {"components": {"qa_lookup": code_component("reference_qa", {
-            "qa_entries": list(rq["entries"]),
+            "qa_entries": packed_literal(list(rq["entries"])) if rq["entries"] else [],
             "domain_stopwords": set(rq["domain_stopwords"]),
             "qa_top_k": rq["top_k"],
         })}},

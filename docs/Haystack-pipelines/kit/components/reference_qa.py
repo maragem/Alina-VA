@@ -1,5 +1,8 @@
+import base64
+import json
 import math
 import re
+import zlib
 from haystack import component
 
 # Curated expert Q&A entries, one dict per entry:
