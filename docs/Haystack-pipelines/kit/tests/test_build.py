@@ -63,7 +63,9 @@ def test_feature_flags_shape_the_pipeline():
     assert agent["chat_generator"]["init_parameters"]["api_key"]["env_vars"] == ["GPTEC_API_KEY"]
     grp = tools["search_corpus"]["pipeline"]["components"]["meta_field_grouping_ranker"]["init_parameters"]
     assert grp == {"group_by": "authority_rank", "subgroup_by": "file_id", "sort_docs_by": "split_id"}
-    assert "QA_ENTRIES = [{'question': 'Example entry" in tools["consult_reference_qa"]["pipeline"]["components"]["qa_lookup"]["init_parameters"]["code"]
+    qa_code = tools["consult_reference_qa"]["pipeline"]["components"]["qa_lookup"]["init_parameters"]["code"]
+    assert "Can a framework contract run for longer than four years?" in qa_code
+    assert len(cfg["reference_qa"]["entries"]) == 34
 
 
 def _strip(node, drop=("code", "system_prompt")):

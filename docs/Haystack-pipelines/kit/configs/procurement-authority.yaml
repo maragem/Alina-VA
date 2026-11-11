@@ -58,10 +58,8 @@ metadata:
   attachment_stamp: {authority_rank: 0}
 
 reference_qa:
-  entries:
-  - question: "Example entry: what is a framework contract?"
-    answer: "Replace with the expert answer. Entries are guidance for the agent, never cited."
-    sources: ["Financial Regulation, Annex I, point 1.3"]
+  # The 34 DIGIT.R3 exemplar Q&A, extracted from ALINA 9k (kit/qa/alina.yaml).
+  entries_file: ../qa/alina.yaml
   domain_stopwords: [procurement]
 
 tools:
