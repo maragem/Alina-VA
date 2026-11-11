@@ -1,0 +1,26 @@
+# Golden questions for the SUMMA assistant: the evaluation set every version is run against.
+# Build it from REAL helpdesk tickets and peer-exchange threads, not from the documentation.
+# Aim for 30 at first, spread over the four question shapes. Judge runs by hand against
+# `expected_sources` and `must_mention`; automatic answer scores were useless on ALINA.
+#
+# shape: procedure | concept | troubleshooting | authorisation | multi_part | named_document
+questions:
+- id: GS-001
+  shape: procedure
+  question: "EXAMPLE - replace: How do I request a down payment on a purchase order?"
+  expected_sources:                    # the document(s) a correct answer cites, by name
+  - SUMMA Payments User Guide
+  must_mention:                        # facts a correct answer cannot omit
+  - Manage Down Payment Requests
+  - pre-financing percentage
+  must_not: []                         # e.g. a superseded procedure from an old guide
+  notes: "ticket #12345, 2025-09"      # where the question came from
+- id: GS-002
+  shape: authorisation
+  question: "EXAMPLE - replace: I cannot see the Approve Invoices tile, how do I get it?"
+  expected_sources: []
+  must_mention:
+  - Local Authorisation Manager
+  must_not:
+  - a search result presented as the answer
+  notes: "pure authorisation: the agent must refer to the LAM without searching"
