@@ -25,7 +25,8 @@ verification order in the kit README.
 
 | File | Purpose | Format |
 |---|---|---|
-| `../kit/qa/summa.yaml` | curated Q&A the agent consults first (guidance, never cited) | YAML list of question / answer / sources, or a CSV with those columns |
+| `../kit/qa/summa.yaml` | curated Q&A the agent consults first (guidance, never cited): 9 canned answers from the Pacioli workspace + 127 entries from the BUDGpedia FAQ page | YAML list of question / answer / sources, or a CSV with those columns |
+| `corpus-additions/*.md` | the same Q&A content as citable documents: upload these to the deepset workspace and index them (Markdown, one `###` heading per question so each becomes one chunk) | Markdown |
 | `eval/golden-questions.yaml` | the evaluation set every version is run against | see the template; 30 questions from real tickets |
 | `files-metadata.template.csv` | optional: `doc_type`, `version`, `document_date` per file, attached as file metadata at upload | CSV; upload metadata always wins over the file-name rules in the config |
 

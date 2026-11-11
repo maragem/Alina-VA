@@ -73,9 +73,9 @@ def test_qa_entries_file_yaml_and_csv(tmp_path):
     assert "Reference entry 1: Inline?" in ns["ReferenceQALookup"]().run(query="inline question")["result"]
 
 
-def test_summa_qa_file_is_read_and_currently_empty():
+def test_summa_qa_file_is_read():
     cfg = load_config(KIT / "configs" / "summa.yaml")
-    assert cfg["reference_qa"]["entries"] == []
+    assert len(cfg["reference_qa"]["entries"]) >= 130 and cfg["reference_qa"]["entries"][0]["question"]
 
 
 def test_template_config_builds_and_verifies():
